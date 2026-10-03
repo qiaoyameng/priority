@@ -75,6 +75,44 @@ update the tree in the wake of that change.
 signature as :meth:`insert_stream <priority.PriorityTree.insert_stream>`, but
 applies only to streams already in the tree.
 
+Placeholder Parents
+-------------------
+
+A dependency may refer to a stream that has not been registered yet. Priority
+represents that reference with a blocked *placeholder* node rather than treating
+it as a registered stream. Placeholders are tracked separately and are subject
+to their own ``maximum_placeholders`` budget. A stream that was explicitly
+inserted and later blocked is never selected as a placeholder, even though it is
+temporarily inactive.
+
+When a stream moves away from a childless placeholder, the placeholder no longer
+represents any dependency and is removed immediately. If the placeholder budget
+is exhausted while creating a new parent, Priority compresses one blocked
+placeholder instead. Childless placeholders are preferred; if every placeholder
+has children, the blocked placeholder with the lowest stream ID is flattened.
+
+Compressing a placeholder moves its children to the placeholder's parent. Let
+the placeholder's scheduling weight be ``W`` and its children's current
+effective weights be ``w_1`` ... ``w_n``. Each child receives the effective
+weight
+
+.. code-block:: text
+
+    w_i * W / (w_1 + ... + w_n)
+
+This preserves both the children's aggregate parent-level share and their
+relative shares. The stream's declared HTTP/2 weight remains an integer between
+1 and 256; the possibly fractional value is used only by the internal scheduler.
+Active streams remain reachable through the same active-or-blocked ancestor gate
+after compression.
+
+Registering a stream whose ID matches an uncompressed placeholder turns that
+node into a normal stream and then applies the requested weight, dependency and
+exclusive flags. If a placeholder was compressed, registering the same ID later
+creates a new normal stream and does not restore the dependencies that were
+reparented during compression. Ordinary and exclusive reprioritization continue
+to work after either outcome.
+
 Removing Streams
 ----------------
 

@@ -22,6 +22,8 @@ Exceptions
 
 .. autoclass:: priority.TooManyStreamsError
 
+.. autoclass:: priority.TooManyPlaceholdersError
+
 .. autoclass:: priority.BadWeightError
 
 .. autoclass:: priority.PseudoStreamError

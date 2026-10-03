@@ -9,6 +9,7 @@ Tests for the Priority trees
 import operator
 import collections
 import itertools
+from fractions import Fraction
 
 import pytest
 
@@ -314,8 +315,8 @@ class TestPriorityTreeManual:
         first_ten_ids = [next(p) for _ in range(0, 10)]
         assert first_ten_ids == [3] * 10
 
-        # Unblock the parent.
-        p.unblock(1)
+        # Register the parent as a real stream.
+        p.insert_stream(stream_id=1)
 
         # Iterate 10 times, expecting only the parent.
         next_ten_ids = [next(p) for _ in range(0, 10)]
@@ -344,8 +345,8 @@ class TestPriorityTreeManual:
         first_ten_ids = [next(p) for _ in range(0, 10)]
         assert first_ten_ids == [3] * 10
 
-        # Unblock the parent.
-        p.unblock(1)
+        # Register the parent as a real stream.
+        p.insert_stream(stream_id=1)
 
         # Iterate 10 times, expecting only the parent.
         next_ten_ids = [next(p) for _ in range(0, 10)]
@@ -475,6 +476,198 @@ class TestPriorityTreeManual:
         with pytest.raises(ValueError) as err:
             priority.PriorityTree(maximum_streams=maximum_streams)
         assert err.value.args[0] == "maximum_streams must be a positive integer."
+
+    @pytest.mark.parametrize("maximum_placeholders", (None, "foo", object(), 2.0))
+    def test_maximum_placeholders_with_non_int_is_error(
+        self, maximum_placeholders
+    ):
+        """
+        Creating a PriorityTree with a non-int argument for
+        maximum_placeholders is an error.
+        """
+        with pytest.raises(TypeError) as err:
+            priority.PriorityTree(
+                maximum_placeholders=maximum_placeholders
+            )
+        assert err.value.args[0] == "maximum_placeholders must be an int."
+
+    @pytest.mark.parametrize("maximum_placeholders", (0, -1, -50))
+    def test_maximum_placeholders_with_bad_int_is_error(
+        self, maximum_placeholders
+    ):
+        """
+        Creating a PriorityTree with a non-positive integer for
+        maximum_placeholders is an error.
+        """
+        with pytest.raises(ValueError) as err:
+            priority.PriorityTree(
+                maximum_placeholders=maximum_placeholders
+            )
+        assert (
+            err.value.args[0]
+            == "maximum_placeholders must be a positive integer."
+        )
+
+    def test_placeholder_is_distinct_from_registered_stream(self):
+        """
+        An automatically inserted parent is a blocked placeholder until a
+        stream with the same ID is explicitly registered.
+        """
+        p = priority.PriorityTree()
+        p.insert_stream(stream_id=3, depends_on=1, weight=32)
+
+        placeholder = p._all_streams[1]
+        assert placeholder.placeholder is True
+        assert placeholder.active is False
+        assert 1 not in p._streams
+        assert 1 in p._placeholders
+
+        with pytest.raises(priority.MissingStreamError):
+            p.unblock(1)
+
+        p.insert_stream(stream_id=1)
+
+        assert placeholder.placeholder is False
+        assert placeholder.active is True
+        assert 1 in p._streams
+        assert 1 not in p._placeholders
+
+    def test_registering_placeholder_supports_exclusive_insertion(self):
+        """
+        Registering a placeholder ID with exclusive=True moves the placeholder
+        subtree beneath the newly registered stream.
+        """
+        p = priority.PriorityTree()
+        p.insert_stream(stream_id=3, depends_on=1, weight=32)
+
+        p.insert_stream(stream_id=1, exclusive=True, weight=8)
+
+        registered = p._streams[1]
+        assert registered.weight == 8
+        assert [child.stream_id for child in registered.children] == [3]
+
+    def test_real_blocked_streams_are_not_compressed_as_placeholders(self):
+        """
+        Only automatically inserted placeholders are eligible for compression.
+        A temporarily blocked registered stream remains in the tree.
+        """
+        p = priority.PriorityTree(maximum_placeholders=1)
+        p.insert_stream(stream_id=1)
+        p.insert_stream(stream_id=2, depends_on=1)
+        p.block(1)
+
+        p.insert_stream(stream_id=4, depends_on=3)
+
+        assert 1 in p._streams
+        assert p._streams[1].active is False
+        assert 3 in p._placeholders
+
+        p.insert_stream(stream_id=6, depends_on=5)
+
+        assert 1 in p._streams
+        assert 1 not in p._placeholders
+        assert {next(p) for _ in range(3)} == {2, 4, 6}
+
+    def test_compressing_placeholder_redistributes_effective_weights(self):
+        """
+        Flattening a placeholder gives its children its aggregate parent-level
+        share while preserving their relative effective weights.
+        """
+        p = priority.PriorityTree()
+        p.insert_stream(stream_id=1, weight=16)
+        p.insert_stream(stream_id=2, depends_on=100, weight=4)
+        p.insert_stream(stream_id=3, depends_on=100, weight=12)
+
+        placeholder = p._placeholders[100]
+        before = collections.Counter(next(p) for _ in range(32))
+
+        p._flatten_placeholder(placeholder)
+
+        after = collections.Counter(next(p) for _ in range(32))
+
+        assert 100 not in p._all_streams
+        assert p._all_streams[2].effective_weight == Fraction(4)
+        assert p._all_streams[3].effective_weight == Fraction(12)
+        assert before == after == collections.Counter({1: 16, 2: 4, 3: 12})
+
+    def test_reprioritizing_fixed_live_streams_to_new_parents_is_bounded(self):
+        """
+        Repeatedly moving a small set of live streams beneath fresh absent
+        parent IDs compresses childless placeholders instead of retaining them.
+        """
+        p = priority.PriorityTree(maximum_placeholders=4)
+        stream_ids = [10, 20, 30]
+
+        for stream_id in stream_ids:
+            p.insert_stream(stream_id)
+
+        expected_total = None
+
+        for index in range(1, 21):
+            for stream_id in stream_ids:
+                parent_id = 1000 + index * 100 + stream_id
+                p.reprioritize(stream_id=stream_id, depends_on=parent_id)
+
+            assert len(p._placeholders) <= 4
+            if expected_total is not None:
+                assert len(p._all_streams) == expected_total
+            else:
+                expected_total = len(p._all_streams)
+
+            scheduled = {next(p) for _ in range(6)}
+            assert scheduled == set(stream_ids)
+
+    def test_placeholder_budget_compresses_nontrivial_placeholder(self):
+        """
+        When the placeholder budget is exhausted, a blocked placeholder with
+        children can be flattened into its parent and the new dependency can
+        then be inserted.
+        """
+        p = priority.PriorityTree(maximum_placeholders=1)
+        p.insert_stream(stream_id=2, depends_on=1, weight=4)
+        p.insert_stream(stream_id=3, depends_on=1, weight=12)
+
+        p.insert_stream(stream_id=5, depends_on=4)
+
+        assert 1 not in p._placeholders
+        assert 4 in p._placeholders
+        assert p._all_streams[2].effective_weight == Fraction(4)
+        assert p._all_streams[3].effective_weight == Fraction(12)
+        assert {next(p) for _ in range(3)} == {2, 3, 5}
+
+    def test_compressed_placeholder_id_can_be_registered_later(self):
+        """
+        Once a placeholder has been compressed, registering its old ID creates
+        a normal stream without a duplicate registration error.
+        """
+        p = priority.PriorityTree(maximum_placeholders=1)
+        p.insert_stream(stream_id=2, depends_on=1, weight=32)
+        p.insert_stream(stream_id=4, depends_on=3)
+
+        assert 1 not in p._all_streams
+
+        p.insert_stream(stream_id=1, weight=8)
+
+        assert 1 in p._streams
+        assert p._streams[1].weight == 8
+        assert {next(p) for _ in range(6)} == {1, 2, 4}
+
+    def test_exclusive_reprioritization_works_after_compression(self):
+        """
+        Streams whose effective weights were redistributed continue to support
+        ordinary exclusive reprioritization.
+        """
+        p = priority.PriorityTree(maximum_placeholders=1)
+        p.insert_stream(stream_id=2, depends_on=1, weight=4)
+        p.insert_stream(stream_id=3, depends_on=1, weight=12)
+        p.insert_stream(stream_id=5, depends_on=4, weight=16)
+
+        p.reprioritize(stream_id=5, exclusive=True)
+
+        stream_five = p._streams[5]
+        assert [child.stream_id for child in stream_five.children] == [2, 3]
+        p.block(5)
+        assert {next(p) for _ in range(4)} == {2, 3}
 
 
 class TestPriorityTreeOutput:

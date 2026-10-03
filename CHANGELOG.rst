@@ -1,6 +1,19 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+**API Changes**
+
+- Add ``maximum_placeholders`` to ``PriorityTree``. Automatically inserted
+  parents are tracked as blocked placeholder nodes separately from registered
+  streams and are compressed when their budget is exhausted.
+- Add ``TooManyPlaceholdersError`` for the case where the placeholder budget is
+  full and no blocked placeholder can be compressed.
+- Add the internal ``Stream.effective_weight`` used to preserve scheduling
+  shares when a placeholder parent is flattened.
+
 2.0.0 (2021-06-27)
 ------------------
 
