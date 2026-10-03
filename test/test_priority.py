@@ -9,6 +9,7 @@ Tests for the Priority trees
 import operator
 import collections
 import itertools
+import json
 
 import pytest
 
@@ -475,6 +476,211 @@ class TestPriorityTreeManual:
         with pytest.raises(ValueError) as err:
             priority.PriorityTree(maximum_streams=maximum_streams)
         assert err.value.args[0] == "maximum_streams must be a positive integer."
+
+
+class TestPriorityTreeSnapshot:
+    def test_snapshot_restores_scheduling_progress(self):
+        tree = readme_tree()
+        for _ in range(7):
+            next(tree)
+
+        snapshot = tree.export_state()
+        restored = priority.PriorityTree.from_state(snapshot)
+
+        expected = [next(tree) for _ in range(40)]
+        actual = [next(restored) for _ in range(40)]
+        assert actual == expected
+
+    def test_snapshot_uses_json_types_and_does_not_advance(self):
+        tree = readme_tree()
+        for _ in range(7):
+            next(tree)
+
+        snapshot = tree.export_state()
+
+        assert json.loads(json.dumps(snapshot)) == snapshot
+        assert snapshot == tree.export_state()
+
+        restored = priority.PriorityTree()
+        restored.restore_state(snapshot)
+        assert next(tree) == next(restored)
+
+    def test_invalid_parent_edge_leaves_receiving_tree_unchanged(self):
+        tree = readme_tree()
+        snapshot = tree.export_state()
+        stream_one = next(
+            stream for stream in snapshot["streams"] if stream["stream_id"] == 1
+        )
+        stream_one["parent_id"] = 999
+
+        receiving_tree = priority.PriorityTree()
+        receiving_tree.insert_stream(100)
+        before = receiving_tree.export_state()
+
+        with pytest.raises(priority.InvalidSnapshotError):
+            receiving_tree.restore_state(snapshot)
+
+        assert receiving_tree.export_state() == before
+        assert next(receiving_tree) == 100
+
+    def test_inconsistent_parent_edge_leaves_receiving_tree_unchanged(self):
+        snapshot = readme_tree().export_state()
+        stream_one = next(
+            stream for stream in snapshot["streams"] if stream["stream_id"] == 1
+        )
+        stream_one["parent_id"] = 3
+
+        receiving_tree = priority.PriorityTree()
+        receiving_tree.insert_stream(100)
+        before = receiving_tree.export_state()
+
+        with pytest.raises(priority.InvalidSnapshotError):
+            receiving_tree.restore_state(snapshot)
+
+        assert receiving_tree.export_state() == before
+        assert next(receiving_tree) == 100
+
+    def test_unknown_snapshot_version_is_rejected(self):
+        snapshot = readme_tree().export_state()
+        snapshot["version"] = 2
+
+        with pytest.raises(priority.UnsupportedSnapshotVersionError):
+            priority.PriorityTree.from_state(snapshot)
+
+    def test_snapshot_capacity_is_enforced_before_restore(self):
+        tree = priority.PriorityTree(maximum_streams=2)
+        tree.insert_stream(1)
+        snapshot = tree.export_state()
+
+        receiving_tree = priority.PriorityTree(maximum_streams=3)
+        before = receiving_tree.export_state()
+
+        receiving_tree.restore_state(snapshot)
+        assert receiving_tree._maximum_streams == 2
+
+        with pytest.raises(priority.TooManyStreamsError):
+            receiving_tree.insert_stream(100)
+
+        large_snapshot = readme_tree().export_state()
+        limited_tree = priority.PriorityTree(maximum_streams=3)
+        limited_before = limited_tree.export_state()
+        with pytest.raises(priority.TooManyStreamsError):
+            limited_tree.restore_state(large_snapshot)
+        assert limited_tree.export_state() == limited_before
+
+    def test_snapshot_preserves_capacity_when_building_new_tree(self):
+        tree = priority.PriorityTree(maximum_streams=2)
+        tree.insert_stream(1)
+        snapshot = tree.export_state()
+
+        restored = priority.PriorityTree.from_state(snapshot)
+        assert restored._maximum_streams == 2
+
+        with pytest.raises(priority.TooManyStreamsError):
+            restored.insert_stream(100)
+
+    @pytest.mark.parametrize(
+        "mutation,error",
+        [
+            (lambda s: s.pop("version"), priority.InvalidSnapshotError),
+            (lambda s: s.__setitem__("version", 0), priority.UnsupportedSnapshotVersionError),
+            (lambda s: s.__setitem__("extra", True), priority.InvalidSnapshotError),
+            (lambda s: s.__setitem__("maximum_streams", 0), priority.InvalidSnapshotError),
+            (lambda s: s["streams"].remove(s["streams"][0]), priority.InvalidSnapshotError),
+            (lambda s: s["streams"].append(dict(s["streams"][1])), priority.DuplicateStreamError),
+            (lambda s: s["streams"][0].__setitem__("weight", 2), priority.BadWeightError),
+            (lambda s: s["streams"][1].__setitem__("weight", 257), priority.BadWeightError),
+            (lambda s: s["streams"][1].__setitem__("weight", "16"), priority.BadWeightError),
+            (lambda s: s["streams"][1].__setitem__("active", "yes"), priority.InvalidSnapshotError),
+            (lambda s: s["streams"][1].__setitem__("deficit", 999), priority.InvalidSnapshotError),
+            (lambda s: s["streams"][1].__setitem__("last_weight", -1), priority.InvalidSnapshotError),
+        ],
+    )
+    def test_malformed_snapshot_is_rejected_before_restore(self, mutation, error):
+        snapshot = readme_tree().export_state()
+        mutation(snapshot)
+        receiving_tree = priority.PriorityTree()
+        before = receiving_tree.export_state()
+
+        with pytest.raises(error):
+            receiving_tree.restore_state(snapshot)
+
+        assert receiving_tree.export_state() == before
+
+    def test_snapshot_rejects_cycle_and_bad_edge_relation(self):
+        cycle_snapshot = readme_tree().export_state()
+        for record in cycle_snapshot["streams"]:
+            if record["stream_id"] == 1:
+                record["parent_id"] = 5
+                record["children"] = [5]
+                record["child_queue"] = [
+                    entry for entry in record["child_queue"] if entry["stream_id"] == 5
+                ]
+            elif record["stream_id"] == 5:
+                record["parent_id"] = 1
+                record["children"] = [1]
+                record["child_queue"] = [{"stream_id": 1, "level": 0}]
+            elif record["stream_id"] == 0:
+                record["children"] = [3, 7]
+                record["child_queue"] = [
+                    entry
+                    for entry in record["child_queue"]
+                    if entry["stream_id"] in (3, 7)
+                ]
+
+        with pytest.raises(priority.PriorityLoop):
+            priority.PriorityTree.from_state(cycle_snapshot)
+
+        edge_snapshot = readme_tree().export_state()
+        for record in edge_snapshot["streams"]:
+            if record["stream_id"] == 0:
+                record["children"].remove(1)
+                record["child_queue"].pop(0)
+            elif record["stream_id"] == 1:
+                record["parent_id"] = 0
+
+        with pytest.raises(priority.InvalidSnapshotError):
+            priority.PriorityTree.from_state(edge_snapshot)
+
+    @pytest.mark.parametrize(
+        "mutate",
+        [
+            lambda s: s["streams"][0]["child_queue"].append(
+                {"stream_id": 3, "level": 10}
+            ),
+            lambda s: s["streams"][0]["child_queue"].__setitem__(
+                0,
+                {"stream_id": 7, "level": 10},
+            ),
+            lambda s: s["streams"][0]["child_queue"].append(
+                {"stream_id": 999, "level": 0}
+            ),
+            lambda s: s["streams"][0]["child_queue"][0].__setitem__("level", -1),
+        ],
+    )
+    def test_snapshot_rejects_invalid_child_queue(self, mutate):
+        snapshot = readme_tree().export_state()
+        mutate(snapshot)
+
+        with pytest.raises(priority.InvalidSnapshotError):
+            priority.PriorityTree.from_state(snapshot)
+
+    def test_snapshot_requires_dictionary(self):
+        with pytest.raises(priority.InvalidSnapshotError):
+            priority.PriorityTree.from_state(object())
+
+    def test_snapshot_rejects_non_primitive_containers(self):
+        snapshot = readme_tree().export_state()
+
+        class SnapshotDict(dict):
+            pass
+
+        with pytest.raises(priority.InvalidSnapshotError):
+            priority.PriorityTree.from_state(SnapshotDict(snapshot))
+
+        snapshot["streams"] = tuple(snapshot["streams"])
+        with pytest.raises(priority.InvalidSnapshotError):
+            priority.PriorityTree.from_state(snapshot)
 
 
 class TestPriorityTreeOutput:

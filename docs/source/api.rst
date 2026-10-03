@@ -25,3 +25,7 @@ Exceptions
 .. autoclass:: priority.BadWeightError
 
 .. autoclass:: priority.PseudoStreamError
+
+.. autoclass:: priority.InvalidSnapshotError
+
+.. autoclass:: priority.UnsupportedSnapshotVersionError

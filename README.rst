@@ -115,6 +115,29 @@ Note that this is not idempotent. Further, calling ``remove_stream`` and then
 re-adding it *may* cause a substantial change in the shape of the priority
 tree, and *will* cause the iteration order to change.
 
+Saving And Restoring State
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A priority tree can be handed to another process with ``export_state``. The
+returned snapshot is a versioned structure made only from dictionaries, lists,
+integers, booleans, and ``None``: it can be passed to a JSON encoder and does
+not use pickle.
+
+Exporting state does not advance the scheduler. A new tree can be constructed
+from a snapshot, or an existing tree can replace its state with one:
+
+.. code-block:: python
+
+    snapshot = old_tree.export_state()
+    new_tree = priority.PriorityTree.from_state(snapshot)
+    # Or:
+    new_tree.restore_state(snapshot)
+
+The snapshot includes the tree shape, weights, blocked streams, queued child
+order, and accumulated scheduling state. It is fully validated before any
+existing tree is modified. Unknown format versions and malformed trees are
+rejected without partially restoring state.
+
 License
 -------
 

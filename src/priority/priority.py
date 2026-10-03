@@ -8,7 +8,16 @@ Implementation of the Priority tree data structure.
 
 import heapq
 
-from typing import List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar
+
+
+SNAPSHOT_VERSION = 1
+SnapshotRecord = Dict[str, Any]
+SnapshotRecords = Dict[int, SnapshotRecord]
+ParentMap = Dict[int, Optional[int]]
+ChildrenMap = Dict[int, List[int]]
+QueueMap = Dict[int, List[Tuple[int, int]]]
+PriorityTreeType = TypeVar("PriorityTreeType", bound="PriorityTree")
 
 
 class PriorityError(Exception):
@@ -79,6 +88,321 @@ class PseudoStreamError(PriorityError):
     """
 
     pass
+
+
+class InvalidSnapshotError(PriorityError):
+    """
+    A priority tree snapshot is malformed.
+    """
+
+    pass
+
+
+class UnsupportedSnapshotVersionError(InvalidSnapshotError):
+    """
+    A priority tree snapshot uses an unknown format version.
+    """
+
+    pass
+
+
+def _require(condition: bool, message: str) -> None:
+    if not condition:
+        raise InvalidSnapshotError(message)
+
+
+def _require_exact_type(value: Any, expected_type: type, name: str) -> None:
+    if type(value) is not expected_type:
+        raise InvalidSnapshotError("%s has an invalid type" % name)
+
+
+def _snapshot_stream(record: Any, name: str) -> Dict[str, Any]:
+    _require_exact_type(record, dict, name)
+    return record
+
+
+def _required_int(record: Dict[str, Any], name: str) -> int:
+    value = record.get(name)
+    _require(type(value) is int, "%s must be an integer" % name)
+    return value
+
+
+def _validate_queue_entry(entry: Any, index: int) -> Tuple[int, int]:
+    entry_name = "child_queue entry %d" % index
+    _require_exact_type(entry, dict, entry_name)
+    _require(
+        set(entry.keys()) == {"stream_id", "level"},
+        "%s has invalid fields" % entry_name,
+    )
+
+    stream_id = entry["stream_id"]
+    level = entry["level"]
+    _require(type(stream_id) is int, "%s stream_id must be an integer" % entry_name)
+    _require(type(level) is int and level >= 0, "%s level is invalid" % entry_name)
+    return level, stream_id
+
+
+def _snapshot_header(snapshot: SnapshotRecord) -> int:
+    version = snapshot.get("version")
+    if "version" not in snapshot:
+        raise InvalidSnapshotError("Snapshot is missing a format version")
+    if type(version) is not int or version != SNAPSHOT_VERSION:
+        raise UnsupportedSnapshotVersionError("Unsupported snapshot version")
+
+    _require(
+        set(snapshot.keys()) == {"version", "maximum_streams", "streams"},
+        "Snapshot has invalid fields",
+    )
+    maximum_streams = snapshot["maximum_streams"]
+    _require(
+        type(maximum_streams) is int and maximum_streams > 0,
+        "maximum_streams must be a positive integer",
+    )
+    _require_exact_type(snapshot["streams"], list, "streams")
+    return maximum_streams
+
+
+def _snapshot_records(stream_records: List[Any]) -> SnapshotRecords:
+    records: SnapshotRecords = {}
+    required_fields = {
+        "stream_id",
+        "parent_id",
+        "weight",
+        "active",
+        "deficit",
+        "last_weight",
+        "children",
+        "child_queue",
+    }
+
+    for index, raw_record in enumerate(stream_records):
+        record = _snapshot_stream(raw_record, "stream %d" % index)
+        _require(
+            set(record.keys()) == required_fields,
+            "stream %d has invalid fields" % index,
+        )
+        stream_id = _required_int(record, "stream_id")
+        if stream_id in records:
+            raise DuplicateStreamError("Stream %d already in snapshot" % stream_id)
+        records[stream_id] = record
+
+    _require(0 in records, "Snapshot is missing root stream 0")
+    return records
+
+
+def _record_parent(stream_id: int, record: SnapshotRecord, records: SnapshotRecords) -> Optional[int]:
+    parent_id = record["parent_id"]
+    if stream_id == 0:
+        _require(parent_id is None, "Root stream must not have a parent")
+        return None
+
+    _require(type(parent_id) is int, "Stream %d has an invalid parent" % stream_id)
+    _require(parent_id in records, "Stream %d has an unknown parent" % stream_id)
+    _require(parent_id != stream_id, "Stream %d must not depend on itself" % stream_id)
+    return parent_id
+
+
+def _record_children(stream_id: int, record: SnapshotRecord, records: SnapshotRecords) -> List[int]:
+    raw_children = record["children"]
+    _require_exact_type(raw_children, list, "Stream %d children" % stream_id)
+    children: List[int] = []
+    for child_id in raw_children:
+        _require(type(child_id) is int, "Stream %d has an invalid child ID" % stream_id)
+        _require(child_id in records, "Stream %d has an unknown child" % stream_id)
+        _require(child_id != 0, "Root stream must not be a child")
+        _require(
+            child_id not in children,
+            "Stream %d is listed as a child twice" % stream_id,
+        )
+        children.append(child_id)
+    return children
+
+
+def _record_queue(stream_id: int, record: SnapshotRecord, children: List[int]) -> List[Tuple[int, int]]:
+    raw_queue = record["child_queue"]
+    _require_exact_type(raw_queue, list, "Stream %d child_queue" % stream_id)
+    queue = [_validate_queue_entry(entry, index) for index, entry in enumerate(raw_queue)]
+    queue_ids = [child_id for _, child_id in queue]
+
+    _require(
+        len(queue_ids) == len(set(queue_ids)),
+        "Stream %d has a duplicated queue entry" % stream_id,
+    )
+    _require(
+        set(queue_ids) == set(children),
+        "Stream %d queue does not match its children" % stream_id,
+    )
+
+    for position, entry in enumerate(queue):
+        left = position * 2 + 1
+        right = left + 1
+        if left < len(queue):
+            _require(entry <= queue[left], "Stream %d queue is not a valid heap" % stream_id)
+        if right < len(queue):
+            _require(entry <= queue[right], "Stream %d queue is not a valid heap" % stream_id)
+    return queue
+
+
+def _validated_snapshot_graph(
+    records: SnapshotRecords,
+) -> Tuple[ParentMap, ChildrenMap, QueueMap]:
+    parents: ParentMap = {}
+    children_by_id: ChildrenMap = {}
+    queues_by_id: QueueMap = {}
+
+    for stream_id, record in records.items():
+        parent_id = _record_parent(stream_id, record, records)
+        weight = record["weight"]
+        if type(weight) is not int:
+            raise BadWeightError("Stream weight should be an integer")
+        if not (1 <= weight <= 256):
+            raise BadWeightError(
+                "Stream weight must be between 1 and 256 (inclusive)"
+            )
+
+        _require(
+            type(record["active"]) is bool,
+            "Stream %d has an invalid active flag" % stream_id,
+        )
+        if stream_id == 0:
+            if record["weight"] != 1:
+                raise BadWeightError(
+                    "Stream weight must be between 1 and 256 (inclusive)"
+                )
+            _require(record["active"] is False, "Root stream must be blocked")
+
+        deficit = _required_int(record, "deficit")
+        if stream_id == 0:
+            _require(deficit == 0, "Stream 0 has an invalid deficit")
+        else:
+            _require(0 <= deficit < weight, "Stream %d has an invalid deficit" % stream_id)
+
+        last_weight = _required_int(record, "last_weight")
+        _require(last_weight >= 0, "Stream %d has an invalid last weight" % stream_id)
+
+        children = _record_children(stream_id, record, records)
+        queue = _record_queue(stream_id, record, children)
+        parents[stream_id] = parent_id
+        children_by_id[stream_id] = children
+        queues_by_id[stream_id] = queue
+
+    return parents, children_by_id, queues_by_id
+
+
+def _validate_edge_consistency(parents: ParentMap, children_by_id: ChildrenMap) -> None:
+    for stream_id, children in children_by_id.items():
+        for child_id in children:
+            _require(
+                parents[child_id] == stream_id,
+                "Stream %d has an inconsistent parent edge" % child_id,
+            )
+
+    for stream_id, parent_id in parents.items():
+        if stream_id != 0:
+            _require(
+                parent_id is not None
+                and stream_id in children_by_id[parent_id],
+                "Stream %d is missing from its parent's children" % stream_id,
+            )
+
+
+def _validate_tree_shape(
+    records: SnapshotRecords,
+    children_by_id: ChildrenMap,
+    maximum_streams: int,
+) -> None:
+    states: Dict[int, str] = {}
+
+    for start in records:
+        if states.get(start) == "done":
+            continue
+
+        stack: List[Tuple[int, bool]] = [(start, False)]
+        while stack:
+            stream_id, exiting = stack.pop()
+            state = states.get(stream_id)
+            if exiting:
+                states[stream_id] = "done"
+                continue
+            if state == "done":
+                continue
+            if state == "visiting":
+                raise PriorityLoop("Snapshot contains a priority loop")
+
+            states[stream_id] = "visiting"
+            stack.append((stream_id, True))
+            stack.extend(
+                (child_id, False) for child_id in children_by_id[stream_id]
+            )
+
+    visited = set()
+    to_visit = [0]
+    while to_visit:
+        stream_id = to_visit.pop()
+        visited.add(stream_id)
+        to_visit.extend(children_by_id[stream_id])
+    _require(visited == set(records), "Snapshot contains an unreachable stream")
+    if len(records) > maximum_streams:
+        raise TooManyStreamsError("Snapshot exceeds maximum_streams")
+
+
+def _build_priority_tree(
+    records: SnapshotRecords,
+    parents: ParentMap,
+    children_by_id: ChildrenMap,
+    queues_by_id: QueueMap,
+    maximum_streams: int,
+    tree_class: Type[PriorityTreeType],
+) -> PriorityTreeType:
+    streams: Dict[int, Stream] = {}
+    for stream_id, record in records.items():
+        stream = object.__new__(Stream)
+        stream.stream_id = stream_id
+        stream._weight = record["weight"]
+        stream.children = []
+        stream.parent = None
+        stream.child_queue = []
+        stream.active = record["active"]
+        stream.last_weight = record["last_weight"]
+        stream._deficit = record["deficit"]
+        streams[stream_id] = stream
+
+    for stream_id, stream in streams.items():
+        parent_id = parents[stream_id]
+        if parent_id is not None:
+            stream.parent = streams[parent_id]
+        stream.children = [streams[child_id] for child_id in children_by_id[stream_id]]
+        stream.child_queue = [
+            (level, streams[child_id]) for level, child_id in queues_by_id[stream_id]
+        ]
+
+    tree = object.__new__(tree_class)
+    tree._root_stream = streams[0]
+    tree._streams = streams
+    tree._maximum_streams = maximum_streams
+    return tree
+
+
+def _build_tree_from_snapshot(
+    snapshot: Any,
+    tree_class: Optional[Type[PriorityTreeType]] = None,
+) -> PriorityTreeType:
+    _require_exact_type(snapshot, dict, "Snapshot")
+    if tree_class is None:
+        tree_class = PriorityTree
+    maximum_streams = _snapshot_header(snapshot)
+    records = _snapshot_records(snapshot["streams"])
+    parents, children_by_id, queues_by_id = _validated_snapshot_graph(records)
+    _validate_edge_consistency(parents, children_by_id)
+    _validate_tree_shape(records, children_by_id, maximum_streams)
+    return _build_priority_tree(
+        records,
+        parents,
+        children_by_id,
+        queues_by_id,
+        maximum_streams,
+        tree_class,
+    )
 
 
 class Stream:
@@ -487,6 +811,65 @@ class PriorityTree:
             self._streams[stream_id].active = True
         except KeyError:
             raise MissingStreamError("Stream %d not in tree" % stream_id)
+
+    def export_state(self) -> Dict[str, Any]:
+        """
+        Return a versioned snapshot containing only JSON-compatible data.
+
+        This method does not advance the scheduler.
+        """
+        streams = []
+        for stream_id in sorted(self._streams):
+            stream = self._streams[stream_id]
+            streams.append(
+                {
+                    "stream_id": stream.stream_id,
+                    "parent_id": (
+                        None if stream.parent is None else stream.parent.stream_id
+                    ),
+                    "weight": stream.weight,
+                    "active": stream.active,
+                    "deficit": stream._deficit,
+                    "last_weight": stream.last_weight,
+                    "children": [child.stream_id for child in stream.children],
+                    "child_queue": [
+                        {"stream_id": child.stream_id, "level": level}
+                        for level, child in stream.child_queue
+                    ],
+                }
+            )
+
+        return {
+            "version": SNAPSHOT_VERSION,
+            "maximum_streams": self._maximum_streams,
+            "streams": streams,
+        }
+
+    @classmethod
+    def from_state(
+        cls: Type[PriorityTreeType],
+        snapshot: Dict[str, Any],
+    ) -> PriorityTreeType:
+        """
+        Build a new tree from a snapshot returned by :meth:`export_state`.
+        """
+        return _build_tree_from_snapshot(snapshot, cls)
+
+    def restore_state(self, snapshot: Dict[str, Any]) -> None:
+        """
+        Replace this tree's state with a fully validated snapshot.
+
+        The existing tree is not modified if the snapshot is invalid.
+        """
+        restored_tree = _build_tree_from_snapshot(snapshot)
+        if len(restored_tree._streams) > self._maximum_streams:
+            raise TooManyStreamsError(
+                "Refusing to insert %d streams into priority tree at once"
+                % (self._maximum_streams + 1)
+            )
+        self._root_stream = restored_tree._root_stream
+        self._streams = restored_tree._streams
+        self._maximum_streams = restored_tree._maximum_streams
 
     # The iterator protocol
     def __iter__(self) -> "PriorityTree":  # pragma: no cover
