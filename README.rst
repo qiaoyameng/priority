@@ -115,6 +115,34 @@ Note that this is not idempotent. Further, calling ``remove_stream`` and then
 re-adding it *may* cause a substantial change in the shape of the priority
 tree, and *will* cause the iteration order to change.
 
+Placeholder Parents
+~~~~~~~~~~~~~~~~~~~
+
+A stream may depend on an ID that has not yet been registered. In that case
+Priority keeps a blocked *placeholder* node so dependent streams remain
+reachable. Placeholders are not registered streams: blocking a registered
+stream never marks it as removable or compressible. Placeholder nodes have a
+separate budget, configured by the ``maximum_placeholders`` argument (default
+1000), independent of ``maximum_streams``.
+
+When the placeholder budget is reached, Priority first removes a childless
+placeholder. If none exists, it compresses a non-empty placeholder whose
+parent is blocked or absent: its children are attached to that parent. A
+non-empty placeholder below an active parent is not compressed, because doing
+so would move its descendants behind that active stream's gate. If the
+placeholder has weight ``W`` and its immediate children have weights totaling
+``S``, a child with weight ``w`` receives that as its new scheduling weight:
+the integer nearest ``W * w / S`` (exact halves round up), clamped to 1-256.
+The child's explicitly registered weight is not changed. This approximately
+preserves both the aggregate weight of the compressed subtree and the
+relative weights of its children while keeping every active descendant
+reachable.
+
+If a stream is later inserted or explicitly unblocked using a placeholder ID,
+the node is promoted to a normal, active registered stream. Subsequent
+ordinary and exclusive reprioritizations continue to move that stream and all
+of its descendants according to the HTTP/2 priority rules.
+
 License
 -------
 

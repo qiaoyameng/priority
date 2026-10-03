@@ -11,6 +11,7 @@ from .priority import (  # noqa
     DuplicateStreamError,
     MissingStreamError,
     TooManyStreamsError,
+    TooManyPlaceholdersError,
     BadWeightError,
     PseudoStreamError,
 )

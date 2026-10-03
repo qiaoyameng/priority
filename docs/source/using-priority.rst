@@ -84,3 +84,30 @@ A stream can be entirely removed from the tree by calling
 :meth:`remove_stream <priority.PriorityTree.remove_stream>` and then re-adding
 it *may* cause a substantial change in the shape of the priority tree, and
 *will* cause the iteration order to change.
+
+Placeholder Parents
+-------------------
+
+A stream may depend on an ID that has not yet been registered. In that case
+the tree keeps a blocked *placeholder* node so the dependent streams stay
+reachable. Placeholders are distinct from registered streams: a registered
+stream that is temporarily blocked is never treated as a placeholder and is
+never automatically compressed.
+
+Placeholders use the separate ``maximum_placeholders`` budget (default
+1000), not ``maximum_streams``. When the budget is reached, the tree first
+removes a childless placeholder. If none exists, it compresses a non-empty
+placeholder whose parent is blocked by moving its children to that parent.
+A non-empty placeholder below an active registered stream is not compressed,
+because doing so would move its descendants behind that active stream's
+gate. For a placeholder with weight ``W``, where the immediate child weights
+total ``S``, a child of weight ``w`` receives the integer nearest
+``W * w / S`` (exact halves round up), clamped to 1-256, as its scheduling
+weight. Its explicitly registered weight is unchanged. This keeps the
+compressed subtree's aggregate weight close to ``W`` and approximates the
+children's relative weights while preserving reachability for every active
+descendant.
+
+Inserting or explicitly unblocking a stream whose ID matches a placeholder
+promotes that node to a normal, active registered stream. Ordinary and
+exclusive reprioritization continue to work after promotion.

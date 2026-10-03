@@ -8,7 +8,7 @@ Implementation of the Priority tree data structure.
 
 import heapq
 
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Set
 
 
 class PriorityError(Exception):
@@ -61,6 +61,14 @@ class TooManyStreamsError(PriorityError):
     pass
 
 
+class TooManyPlaceholdersError(TooManyStreamsError):
+    """
+    The placeholder budget is exhausted and no placeholder can be compressed.
+    """
+
+    pass
+
+
 class BadWeightError(PriorityError):
     """
     An attempt was made to create a stream with an invalid weight.
@@ -89,14 +97,21 @@ class Stream:
     :param weight: (optional) The stream weight. Defaults to 16.
     """
 
-    def __init__(self, stream_id: int, weight: int = 16) -> None:
+    def __init__(
+        self,
+        stream_id: int,
+        weight: int = 16,
+        placeholder: bool = False,
+    ) -> None:
         self.stream_id = stream_id
         self.weight = weight
         self.children: List[Stream] = []
         self.parent: Optional[Stream] = None
         self.child_queue: List[Tuple[int, Stream]] = []
-        self.active = True
+        self.placeholder = placeholder
+        self.active = not placeholder
         self.last_weight = 0
+        self._effective_weight = weight
         self._deficit = 0
 
     @property
@@ -206,8 +221,8 @@ class Stream:
         finally:
             for level, child in popped_streams:
                 self.last_weight = level
-                level += (256 + child._deficit) // child.weight
-                child._deficit = (256 + child._deficit) % child.weight
+                level += (256 + child._deficit) // child._effective_weight
+                child._deficit = (256 + child._deficit) % child._effective_weight
                 heapq.heappush(self.child_queue, (level, child))
 
         return next_stream
@@ -296,14 +311,46 @@ class PriorityTree:
         them too, unless they want to be even more conservative than we are by
         default.
     :type maximum_streams: ``int``
+    :param maximum_placeholders: The maximum number of placeholder nodes that
+        may be retained at once. Placeholders are created when a stream
+        depends on an ID that has not been registered. They have a separate
+        budget from registered streams. When this budget is reached, the tree
+        will first remove a childless placeholder, or compress one non-empty
+        placeholder. Defaults to 1000.
+    :type maximum_placeholders: ``int``
+
+    A placeholder is a blocked, internal node whose ID has only appeared as
+    an absent parent. It is not a registered stream, even if it later becomes
+    blocked. A registered stream that is temporarily blocked is never
+    compressed.
+
+    When a non-empty placeholder with weight ``W`` is compressed, it must
+    have a blocked parent. Its children are moved to that parent. If a child
+    previously had effective weight ``w`` and the immediate children had
+    total effective weight ``S``, the child's scheduling weight becomes the
+    integer nearest ``W * w / S`` (exact halves round up), clamped to the
+    range 1–256. The child's explicitly assigned ``weight`` is unchanged.
+    This keeps the compressed subtree's aggregate weight close to ``W`` and
+    preserves the children's relative weights as closely as HTTP/2's integer
+    weights allow. All active streams below the placeholder remain reachable
+    through their new parent.
+
+    Inserting or explicitly unblocking a stream with the same ID as a
+    placeholder promotes that node into a registered, active stream.
     """
 
-    def __init__(self, maximum_streams: int = 1000) -> None:
+    def __init__(
+        self,
+        maximum_streams: int = 1000,
+        maximum_placeholders: int = 1000,
+    ) -> None:
         # This flat array keeps hold of all the streams that are logically
         # dependent on stream 0.
         self._root_stream = Stream(stream_id=0, weight=1)
         self._root_stream.active = False
         self._streams = {0: self._root_stream}
+        self._registered_stream_ids: Set[int] = {0}
+        self._placeholder_stream_ids: Set[int] = set()
 
         if not isinstance(maximum_streams, int):
             raise TypeError("maximum_streams must be an int.")
@@ -311,19 +358,170 @@ class PriorityTree:
             raise ValueError("maximum_streams must be a positive integer.")
         self._maximum_streams = maximum_streams
 
-    def _get_or_insert_parent(self, parent_stream_id: int) -> Stream:
+        if not isinstance(maximum_placeholders, int):
+            raise TypeError("maximum_placeholders must be an int.")
+        if maximum_placeholders <= 0:
+            raise ValueError("maximum_placeholders must be a positive integer.")
+        self._maximum_placeholders = maximum_placeholders
+
+    def _get_or_insert_parent(
+        self,
+        parent_stream_id: int,
+        protected_stream_id: Optional[int] = None,
+    ) -> Stream:
         """
         When inserting or reprioritizing a stream it is possible to make it
-        dependent on a stream that is no longer in the tree. In this situation,
-        rather than bail out, we should insert the parent stream into the tree
-        with default priority and mark it as blocked.
+        dependent on a stream that has not been registered. In this
+        situation, rather than bail out, we insert a blocked placeholder
+        node.
         """
         try:
             return self._streams[parent_stream_id]
         except KeyError:
-            self.insert_stream(parent_stream_id)
-            self.block(parent_stream_id)
-            return self._streams[parent_stream_id]
+            self._ensure_placeholder_capacity(protected_stream_id)
+            placeholder = Stream(parent_stream_id, placeholder=True)
+            self._streams[parent_stream_id] = placeholder
+            self._placeholder_stream_ids.add(parent_stream_id)
+            self._root_stream.add_child(placeholder)
+            return placeholder
+
+    def _ensure_placeholder_capacity(
+        self,
+        protected_stream_id: Optional[int] = None,
+    ) -> None:
+        if len(self._placeholder_stream_ids) < self._maximum_placeholders:
+            return
+
+        if self._compress_placeholder(protected_stream_id) is None:
+            raise TooManyPlaceholdersError(
+                "Refusing to retain more than %d placeholder streams"
+                % self._maximum_placeholders
+            )
+
+    @staticmethod
+    def _compressed_child_effective_weight(
+        placeholder_weight: int,
+        child_weight: int,
+        total_child_weight: int,
+    ) -> int:
+        scaled_weight = (
+            2 * placeholder_weight * child_weight + total_child_weight
+        ) // (2 * total_child_weight)
+        return min(256, max(1, scaled_weight))
+
+    def _compress_placeholder(
+        self,
+        protected_stream_id: Optional[int] = None,
+    ) -> Optional[int]:
+        """
+        Compress one placeholder and return its ID, if an eligible node
+        exists. Childless placeholders are removed first. A non-empty
+        placeholder is eligible only when its parent is blocked, which keeps
+        its active descendants reachable after compression.
+        """
+        empty_candidate = None
+        non_empty_candidate = None
+
+        for placeholder_id in sorted(self._placeholder_stream_ids):
+            if placeholder_id == protected_stream_id:
+                continue
+
+            placeholder = self._streams[placeholder_id]
+            if not placeholder.children:
+                if empty_candidate is None:
+                    empty_candidate = placeholder
+                continue
+
+            parent = placeholder.parent
+            if (
+                non_empty_candidate is None
+                and parent is not None
+                and not parent.active
+            ):
+                non_empty_candidate = placeholder
+
+        candidate = empty_candidate or non_empty_candidate
+
+        if candidate is None:
+            return None
+
+        parent = candidate.parent
+        children = list(candidate.children)
+        total_child_weight = sum(child._effective_weight for child in children)
+
+        for child in children:
+            child_weight = self._compressed_child_effective_weight(
+                candidate.weight,
+                child._effective_weight,
+                total_child_weight,
+            )
+            candidate.remove_child(child, strip_children=False)
+            child._effective_weight = child_weight
+            parent.add_child(child)  # type: ignore[union-attr]
+
+        parent.remove_child(  # type: ignore[union-attr]
+            candidate,
+            strip_children=False,
+        )
+        placeholder_id = candidate.stream_id
+        del self._streams[placeholder_id]
+        self._placeholder_stream_ids.remove(placeholder_id)
+        return placeholder_id
+
+    def _promote_placeholder(
+        self,
+        placeholder: Stream,
+        depends_on: int,
+        weight: int,
+        exclusive: bool,
+    ) -> None:
+        if len(self._registered_stream_ids) >= self._maximum_streams:
+            raise TooManyStreamsError(
+                "Refusing to insert %d streams into priority tree at once"
+                % (self._maximum_streams + 1)
+            )
+
+        placeholder_id = placeholder.stream_id
+        placeholder.placeholder = False
+        self._placeholder_stream_ids.remove(placeholder_id)
+        self._registered_stream_ids.add(placeholder_id)
+
+        new_parent = self._get_or_insert_parent(depends_on, placeholder_id)
+        placeholder.weight = weight
+        self._move_stream(placeholder, new_parent, weight, exclusive)
+        placeholder.active = True
+
+    def _move_stream(
+        self,
+        current_stream: Stream,
+        new_parent: Stream,
+        weight: int,
+        exclusive: bool,
+    ) -> None:
+        current_stream.weight = weight
+        current_stream._effective_weight = weight
+        cycle = (
+            False
+            if new_parent.stream_id == 0
+            else _stream_cycle(new_parent, current_stream)
+        )
+
+        if cycle:
+            new_parent.parent.remove_child(  # type: ignore[union-attr]
+                new_parent,
+            )
+            current_stream.parent.add_child(  # type: ignore[union-attr]
+                new_parent,
+            )
+
+        current_stream.parent.remove_child(  # type: ignore[union-attr]
+            current_stream, strip_children=False
+        )
+
+        if exclusive:
+            new_parent.add_child_exclusive(current_stream)
+        else:
+            new_parent.add_child(current_stream)
 
     def _exclusive_insert(
         self,
@@ -354,10 +552,25 @@ class PriorityTree:
         :param exclusive: (optional) Whether this new stream should be an
             exclusive dependency of the parent.
         """
+        existing_stream = self._streams.get(stream_id)
+        if existing_stream is not None and existing_stream.placeholder:
+            if not depends_on:
+                depends_on = 0
+            elif depends_on == stream_id:
+                raise PriorityLoop("Stream %d must not depend on itself." % stream_id)
+
+            self._promote_placeholder(
+                existing_stream,
+                depends_on,
+                weight,
+                exclusive,
+            )
+            return
+
         if stream_id in self._streams:
             raise DuplicateStreamError("Stream %d already in tree" % stream_id)
 
-        if (len(self._streams) + 1) > self._maximum_streams:
+        if len(self._registered_stream_ids) >= self._maximum_streams:
             raise TooManyStreamsError(
                 "Refusing to insert %d streams into priority tree at once"
                 % (self._maximum_streams + 1)
@@ -370,15 +583,14 @@ class PriorityTree:
         elif depends_on == stream_id:
             raise PriorityLoop("Stream %d must not depend on itself." % stream_id)
 
+        parent = self._get_or_insert_parent(depends_on, stream_id)
         if exclusive:
-            parent_stream = self._get_or_insert_parent(depends_on)
-            self._exclusive_insert(parent_stream, stream)
-            self._streams[stream_id] = stream
-            return
+            self._exclusive_insert(parent, stream)
+        else:
+            parent.add_child(stream)
 
-        parent = self._get_or_insert_parent(depends_on)
-        parent.add_child(stream)
         self._streams[stream_id] = stream
+        self._registered_stream_ids.add(stream_id)
 
     def reprioritize(
         self,
@@ -415,33 +627,10 @@ class PriorityTree:
             if depends_on == stream_id:
                 raise PriorityLoop("Stream %d must not depend on itself" % stream_id)
 
-            new_parent = self._get_or_insert_parent(depends_on)
-            cycle = _stream_cycle(new_parent, current_stream)
+            new_parent = self._get_or_insert_parent(depends_on, stream_id)
         else:
             new_parent = self._streams[0]
-            cycle = False
-
-        current_stream.weight = weight
-
-        # Our new parent is currently dependent on us. We should remove it from
-        # its parent, and make it a child of our current parent, and then
-        # continue.
-        if cycle:
-            new_parent.parent.remove_child(  # type: ignore[union-attr]
-                new_parent,
-            )
-            current_stream.parent.add_child(  # type: ignore[union-attr]
-                new_parent,
-            )
-
-        current_stream.parent.remove_child(  # type: ignore[union-attr]
-            current_stream, strip_children=False
-        )
-
-        if exclusive:
-            new_parent.add_child_exclusive(current_stream)
-        else:
-            new_parent.add_child(current_stream)
+        self._move_stream(current_stream, new_parent, weight, exclusive)
 
     def remove_stream(self, stream_id: int) -> None:
         """
@@ -459,6 +648,8 @@ class PriorityTree:
 
         parent = child.parent
         parent.remove_child(child)  # type: ignore[union-attr]
+        self._registered_stream_ids.discard(stream_id)
+        self._placeholder_stream_ids.discard(stream_id)
 
     def block(self, stream_id: int) -> None:
         """
@@ -470,9 +661,10 @@ class PriorityTree:
             raise PseudoStreamError("Cannot block stream 0")
 
         try:
-            self._streams[stream_id].active = False
+            stream = self._streams[stream_id]
         except KeyError:
             raise MissingStreamError("Stream %d not in tree" % stream_id)
+        stream.active = False
 
     def unblock(self, stream_id: int) -> None:
         """
@@ -484,9 +676,21 @@ class PriorityTree:
             raise PseudoStreamError("Cannot unblock stream 0")
 
         try:
-            self._streams[stream_id].active = True
+            stream = self._streams[stream_id]
         except KeyError:
             raise MissingStreamError("Stream %d not in tree" % stream_id)
+
+        if stream.placeholder:
+            if len(self._registered_stream_ids) >= self._maximum_streams:
+                raise TooManyStreamsError(
+                    "Refusing to insert %d streams into priority tree at once"
+                    % (self._maximum_streams + 1)
+                )
+            stream.placeholder = False
+            self._placeholder_stream_ids.remove(stream_id)
+            self._registered_stream_ids.add(stream_id)
+
+        stream.active = True
 
     # The iterator protocol
     def __iter__(self) -> "PriorityTree":  # pragma: no cover

@@ -1,6 +1,19 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+**Security Fixes**
+
+- Add a separate ``maximum_placeholders`` budget for blocked placeholder
+  parents automatically created when a stream depends on an ID that has not
+  been registered. When the budget is exhausted, childless placeholders are
+  removed and eligible non-empty placeholders are compressed with documented
+  integer scheduling-weight reallocation. Registered streams, including
+  temporarily blocked ones, remain distinct from placeholders and are never
+  compressed.
+
 2.0.0 (2021-06-27)
 ------------------
 
