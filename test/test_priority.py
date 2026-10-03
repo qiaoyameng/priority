@@ -6,6 +6,8 @@ test_priority
 Tests for the Priority trees
 """
 
+import copy
+import json
 import operator
 import collections
 import itertools
@@ -475,6 +477,150 @@ class TestPriorityTreeManual:
         with pytest.raises(ValueError) as err:
             priority.PriorityTree(maximum_streams=maximum_streams)
         assert err.value.args[0] == "maximum_streams must be a positive integer."
+
+
+class TestPriorityTreeSnapshot:
+    def test_snapshot_api_aliases_match(self):
+        tree = readme_tree()
+
+        assert tree.export_state() == tree.to_dict()
+
+    def test_cycle_reversal_keeps_descendants_together(self):
+        tree = priority.PriorityTree()
+        tree.insert_stream(stream_id=1)
+        tree.insert_stream(stream_id=3, depends_on=1)
+        tree.insert_stream(stream_id=5, depends_on=3)
+
+        tree.reprioritize(stream_id=1, depends_on=3)
+
+        snapshot = tree.export_state()
+        restored = priority.PriorityTree.from_dict(copy.deepcopy(snapshot))
+
+        assert restored.export_state() == snapshot
+        child_ids = [child.stream_id for child in restored._streams[3].children]
+        assert child_ids == [5, 1]
+        assert restored._streams[1].children == []
+        assert restored._streams[5].parent.stream_id == 3
+
+    def test_snapshot_restores_scheduling_progress(self):
+        tree = readme_tree()
+        tree.insert_stream(stream_id=13, depends_on=3, weight=24)
+        tree.block(1)
+        [next(tree) for _ in range(20)]
+
+        snapshot = tree.export_state()
+        restored = priority.PriorityTree.restore_state(copy.deepcopy(snapshot))
+
+        assert restored.export_state() == snapshot
+        assert [next(restored) for _ in range(40)] == [
+            next(tree) for _ in range(40)
+        ]
+
+    def test_snapshot_is_json_compatible_and_does_not_advance_schedule(self):
+        tree = readme_tree()
+        [next(tree) for _ in range(7)]
+        before = tree.export_state()
+
+        encoded = json.dumps(before)
+        restored = priority.PriorityTree.restore_state(json.loads(encoded))
+
+        assert tree.export_state() == before
+        expected = [next(tree) for _ in range(20)]
+        assert [next(restored) for _ in range(20)] == expected
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            lambda snapshot: snapshot.pop("version"),
+            lambda snapshot: snapshot.update(version=2),
+            lambda snapshot: snapshot.update(version=True),
+            lambda snapshot: snapshot.update(version="1"),
+            lambda snapshot: snapshot.update(unexpected=True),
+            lambda snapshot: snapshot.update(maximum_streams=0),
+            lambda snapshot: snapshot["streams"].pop(0),
+            lambda snapshot: snapshot["streams"][1].update(id=0),
+            lambda snapshot: snapshot["streams"][0].update(weight=2),
+            lambda snapshot: snapshot["streams"][0].update(active=True),
+            lambda snapshot: snapshot["streams"][1].update(weight=0),
+            lambda snapshot: snapshot["streams"][1].update(weight=257),
+            lambda snapshot: snapshot["streams"][1].update(weight=16.0),
+            lambda snapshot: snapshot["streams"][1].update(active="yes"),
+            lambda snapshot: snapshot["streams"][1].update(parent=999),
+            lambda snapshot: snapshot["streams"][1]["children"].append(3),
+            lambda snapshot: snapshot["streams"][1]["queue"].append([0, 3]),
+            lambda snapshot: snapshot["streams"][0]["queue"].reverse(),
+            lambda snapshot: snapshot["streams"][1].update(last_weight=-1),
+            lambda snapshot: snapshot["streams"][1].update(deficit=256),
+        ],
+    )
+    def test_invalid_snapshots_are_rejected(self, change):
+        snapshot = readme_tree().export_state()
+        change(snapshot)
+
+        with pytest.raises(priority.PriorityError):
+            priority.PriorityTree.restore_state(snapshot)
+
+    def test_unknown_version_is_explicitly_rejected(self):
+        snapshot = readme_tree().export_state()
+        snapshot["version"] = 99
+
+        with pytest.raises(priority.UnsupportedSnapshotVersionError):
+            priority.PriorityTree.restore_state(snapshot)
+
+    def test_duplicate_stream_ids_are_rejected(self):
+        snapshot = readme_tree().export_state()
+        snapshot["streams"].append(copy.deepcopy(snapshot["streams"][1]))
+
+        with pytest.raises(priority.DuplicateStreamError):
+            priority.PriorityTree.restore_state(snapshot)
+
+    def test_snapshot_cycles_are_rejected(self):
+        snapshot = readme_tree().export_state()
+        streams = {stream["id"]: stream for stream in snapshot["streams"]}
+        streams[0]["children"].remove(1)
+        streams[0]["queue"] = [
+            entry for entry in streams[0]["queue"] if entry[1] != 1
+        ]
+        streams[1]["parent"] = 5
+        streams[5]["parent"] = 1
+        streams[5]["children"] = [1]
+
+        with pytest.raises(priority.PriorityLoop):
+            priority.PriorityTree.restore_state(snapshot)
+
+    def test_capacity_is_checked_before_restore(self):
+        snapshot = readme_tree().export_state()
+
+        with pytest.raises(priority.TooManyStreamsError):
+            priority.PriorityTree.restore_state(
+                snapshot, maximum_streams=5
+            )
+
+        snapshot["maximum_streams"] = 5
+        with pytest.raises(priority.TooManyStreamsError):
+            priority.PriorityTree.restore_state(snapshot)
+
+    def test_import_state_is_atomic(self):
+        receiver = priority.PriorityTree()
+        receiver.insert_stream(stream_id=42, weight=32)
+        expected = receiver.export_state()
+        snapshot = readme_tree().export_state()
+        snapshot["streams"][1]["parent"] = 999
+
+        with pytest.raises(priority.InvalidSnapshotError):
+            receiver.import_state(snapshot)
+
+        assert receiver.export_state() == expected
+        assert [next(receiver) for _ in range(5)] == [42] * 5
+
+    def test_import_state_replaces_complete_tree(self):
+        receiver = priority.PriorityTree(maximum_streams=1000)
+        receiver.insert_stream(42)
+        snapshot = readme_tree().export_state()
+
+        receiver.import_state(snapshot)
+
+        assert receiver.export_state() == snapshot
 
 
 class TestPriorityTreeOutput:

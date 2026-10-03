@@ -107,6 +107,25 @@ Additionally, the priority of a stream may change. When it does, the
 change. ``reprioritize`` has the same signature as ``insert_stream``, but
 applies only to streams already in the tree.
 
+Saving And Restoring Progress
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A tree can be handed to another process with ``export_state``. The returned
+object uses only dictionaries, lists, integers, booleans and ``None``, so it
+can be encoded with JSON and does not require ``pickle``. In addition to the
+streams, parents and weights, it includes the scheduler queues and cumulative
+state needed to preserve the next stream selection.
+
+.. code-block:: python
+
+    >>> snapshot = p.export_state()
+    >>> restored = priority.PriorityTree.restore_state(snapshot)
+
+Snapshots are fully validated before a receiving tree is changed. An invalid
+snapshot raises a ``PriorityError`` subclass and leaves an existing tree
+untouched. To replace an existing tree atomically, call its ``import_state``
+method.
+
 Removing Streams
 ~~~~~~~~~~~~~~~~
 

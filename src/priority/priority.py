@@ -8,7 +8,7 @@ Implementation of the Priority tree data structure.
 
 import heapq
 
-from typing import List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class PriorityError(Exception):
@@ -79,6 +79,36 @@ class PseudoStreamError(PriorityError):
     """
 
     pass
+
+
+class InvalidSnapshotError(PriorityError):
+    """
+    A priority tree snapshot is malformed and cannot be restored.
+    """
+
+    pass
+
+
+class UnsupportedSnapshotVersionError(InvalidSnapshotError):
+    """
+    A priority tree snapshot uses an unrecognised format version.
+    """
+
+    pass
+
+
+SNAPSHOT_VERSION = 1
+_SNAPSHOT_KEYS = {"version", "maximum_streams", "streams"}
+_STREAM_SNAPSHOT_KEYS = {
+    "id",
+    "parent",
+    "weight",
+    "active",
+    "children",
+    "queue",
+    "last_weight",
+    "deficit",
+}
 
 
 class Stream:
@@ -272,6 +302,218 @@ def _stream_cycle(new_parent: Stream, current: Stream) -> bool:
     )  # pragma: no cover
 
 
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _validate_snapshot(
+    snapshot: Any,
+    receiver_maximum_streams: Optional[int] = None,
+) -> Tuple[int, Dict[int, Dict[str, Any]]]:
+    if not isinstance(snapshot, dict):
+        raise InvalidSnapshotError("Snapshot must be an object.")
+
+    if "version" not in snapshot:
+        raise InvalidSnapshotError("Snapshot is missing a format version.")
+    if (
+        not _is_int(snapshot["version"])
+        or snapshot["version"] != SNAPSHOT_VERSION
+    ):
+        raise UnsupportedSnapshotVersionError(
+            "Unsupported snapshot format version: %r" % (snapshot["version"],)
+        )
+    if set(snapshot) != _SNAPSHOT_KEYS:
+        raise InvalidSnapshotError("Snapshot contains invalid top-level fields.")
+
+    maximum_streams = snapshot["maximum_streams"]
+    if not _is_int(maximum_streams) or maximum_streams <= 0:
+        raise InvalidSnapshotError("maximum_streams must be a positive integer.")
+    if (
+        receiver_maximum_streams is not None
+        and maximum_streams > receiver_maximum_streams
+    ):
+        raise TooManyStreamsError(
+            "Snapshot allows more streams than the receiving priority tree."
+        )
+
+    raw_streams = snapshot["streams"]
+    if not isinstance(raw_streams, list) or not raw_streams:
+        raise InvalidSnapshotError("Snapshot must contain a non-empty stream list.")
+
+    streams: Dict[int, Dict[str, Any]] = {}
+
+    for raw_stream in raw_streams:
+        if not isinstance(raw_stream, dict):
+            raise InvalidSnapshotError("Each stream must be an object.")
+        if set(raw_stream) != _STREAM_SNAPSHOT_KEYS:
+            raise InvalidSnapshotError("Stream contains invalid fields.")
+
+        stream_id = raw_stream["id"]
+        if not _is_int(stream_id):
+            raise InvalidSnapshotError("Stream IDs must be integers.")
+        if stream_id in streams:
+            raise DuplicateStreamError(
+                "Stream %d appears more than once." % stream_id
+            )
+
+        parent_id = raw_stream["parent"]
+        if stream_id != 0 and not _is_int(parent_id):
+            raise InvalidSnapshotError(
+                "Stream %d must have an integer parent." % stream_id
+            )
+
+        weight = raw_stream["weight"]
+        if not _is_int(weight) or not (1 <= weight <= 256):
+            raise BadWeightError(
+                "Stream %d weight must be between 1 and 256 (inclusive)." % stream_id
+            )
+
+        active = raw_stream["active"]
+        if not isinstance(active, bool):
+            raise InvalidSnapshotError(
+                "Stream %d active state must be a boolean." % stream_id
+            )
+
+        children = raw_stream["children"]
+        if not isinstance(children, list) or not all(
+            _is_int(child) for child in children
+        ):
+            raise InvalidSnapshotError(
+                "Stream %d children must be a list of integers." % stream_id
+            )
+        if len(set(children)) != len(children):
+            raise InvalidSnapshotError(
+                "Stream %d has a duplicated child." % stream_id
+            )
+
+        queue = raw_stream["queue"]
+        if not isinstance(queue, list):
+            raise InvalidSnapshotError(
+                "Stream %d queue must be a list of queue entries." % stream_id
+            )
+
+        queue_entries = []
+        for entry in queue:
+            if (
+                not isinstance(entry, list)
+                or len(entry) != 2
+                or not _is_int(entry[0])
+                or not _is_int(entry[1])
+            ):
+                raise InvalidSnapshotError(
+                    "Stream %d has an invalid queue entry." % stream_id
+                )
+            level, child_id = entry
+            if level < 0:
+                raise InvalidSnapshotError(
+                    "Stream %d has a negative queue level." % stream_id
+                )
+            queue_entries.append((level, child_id))
+
+        last_weight = raw_stream["last_weight"]
+        if not _is_int(last_weight) or last_weight < 0:
+            raise InvalidSnapshotError(
+                "Stream %d last_weight must be a non-negative integer." % stream_id
+            )
+
+        deficit = raw_stream["deficit"]
+        if not _is_int(deficit) or not (0 <= deficit <= 255):
+            raise InvalidSnapshotError(
+                "Stream %d deficit must be between 0 and 255." % stream_id
+            )
+
+        streams[stream_id] = {
+            "id": stream_id,
+            "parent": parent_id,
+            "weight": weight,
+            "active": active,
+            "children": children,
+            "queue": queue_entries,
+            "last_weight": last_weight,
+            "deficit": deficit,
+        }
+
+    if 0 not in streams:
+        raise InvalidSnapshotError("Snapshot must contain root stream 0.")
+
+    root = streams[0]
+    if (
+        root["parent"] is not None
+        or root["weight"] != 1
+        or root["active"] is not False
+        or root["deficit"] != 0
+    ):
+        raise InvalidSnapshotError("Root stream 0 has invalid state.")
+
+    if len(streams) > maximum_streams:
+        raise TooManyStreamsError(
+            "Snapshot contains more streams than its maximum allows."
+        )
+
+    for stream_id, stream in streams.items():
+        parent_id = stream["parent"]
+        if stream_id != 0:
+            if parent_id not in streams:
+                raise InvalidSnapshotError(
+                    "Stream %d has missing parent %d." % (stream_id, parent_id)
+                )
+            if stream_id not in streams[parent_id]["children"]:
+                raise InvalidSnapshotError(
+                    "Parent %d does not list stream %d as a child."
+                    % (parent_id, stream_id)
+                )
+
+        for child_id in stream["children"]:
+            if child_id not in streams:
+                raise InvalidSnapshotError(
+                    "Stream %d has missing child %d." % (stream_id, child_id)
+                )
+            if child_id == 0:
+                raise InvalidSnapshotError("Root stream 0 cannot be a child.")
+            if streams[child_id]["parent"] != stream_id:
+                raise InvalidSnapshotError(
+                    "Stream %d does not have parent %d." % (child_id, stream_id)
+                )
+
+    parent_state = {0: "done"}
+    for start_stream_id in streams:
+        if start_stream_id == 0:
+            continue
+
+        stream_id = start_stream_id
+        path = []
+        while stream_id not in parent_state:
+            parent_state[stream_id] = "visiting"
+            path.append(stream_id)
+            stream_id = streams[stream_id]["parent"]
+
+        if parent_state[stream_id] == "visiting":
+            raise PriorityLoop("Snapshot contains a priority loop.")
+
+        for visited_stream_id in path:
+            parent_state[visited_stream_id] = "done"
+
+    for stream_id, stream in streams.items():
+        queue_child_ids = [child_id for level, child_id in stream["queue"]]
+        if set(queue_child_ids) != set(stream["children"]):
+            raise InvalidSnapshotError(
+                "Stream %d queue does not match its children." % stream_id
+            )
+        if len(set(queue_child_ids)) != len(queue_child_ids):
+            raise InvalidSnapshotError(
+                "Stream %d queue contains a duplicated child." % stream_id
+            )
+
+        expected_heap = list(stream["queue"])
+        heapq.heapify(expected_heap)
+        if stream["queue"] != expected_heap:
+            raise InvalidSnapshotError(
+                "Stream %d queue is not in heap order." % stream_id
+            )
+
+    return maximum_streams, streams
+
+
 class PriorityTree:
     """
     A HTTP/2 Priority Tree.
@@ -310,6 +552,113 @@ class PriorityTree:
         if maximum_streams <= 0:
             raise ValueError("maximum_streams must be a positive integer.")
         self._maximum_streams = maximum_streams
+
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Export a versioned, pickle-independent snapshot of the tree.
+
+        The snapshot contains only JSON-compatible primitive types, lists, and
+        dictionaries. Exporting does not advance the scheduler.
+        """
+        streams = []
+        for stream_id in sorted(self._streams):
+            stream = self._streams[stream_id]
+            streams.append(
+                {
+                    "id": stream.stream_id,
+                    "parent": (
+                        None if stream.parent is None else stream.parent.stream_id
+                    ),
+                    "weight": stream.weight,
+                    "active": stream.active,
+                    "children": [child.stream_id for child in stream.children],
+                    "queue": [
+                        [level, child.stream_id]
+                        for level, child in stream.child_queue
+                    ],
+                    "last_weight": stream.last_weight,
+                    "deficit": stream._deficit,
+                }
+            )
+
+        return {
+            "version": SNAPSHOT_VERSION,
+            "maximum_streams": self._maximum_streams,
+            "streams": streams,
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        snapshot: Any,
+        maximum_streams: Optional[int] = None,
+    ) -> "PriorityTree":
+        """
+        Validate a snapshot and return a new tree containing its full state.
+        """
+        snapshot_maximum_streams, streams = _validate_snapshot(
+            snapshot,
+            maximum_streams,
+        )
+
+        tree = cls(maximum_streams=snapshot_maximum_streams)
+        restored = {}
+
+        for stream_id, stream_state in streams.items():
+            stream = Stream(stream_id, stream_state["weight"])
+            stream.active = stream_state["active"]
+            stream.last_weight = stream_state["last_weight"]
+            stream._deficit = stream_state["deficit"]
+            restored[stream_id] = stream
+
+        for stream_id, stream_state in streams.items():
+            stream = restored[stream_id]
+            stream.parent = (
+                None
+                if stream_state["parent"] is None
+                else restored[stream_state["parent"]]
+            )
+            stream.children = [
+                restored[child_id] for child_id in stream_state["children"]
+            ]
+            stream.child_queue = [
+                (level, restored[child_id])
+                for level, child_id in stream_state["queue"]
+            ]
+
+        tree._root_stream = restored[0]
+        tree._streams = restored
+        tree._maximum_streams = snapshot_maximum_streams
+        return tree
+
+    def export_state(self) -> Dict[str, Any]:
+        """
+        Export a versioned, pickle-independent snapshot of the tree.
+        """
+        return self.to_dict()
+
+    @classmethod
+    def restore_state(
+        cls,
+        snapshot: Any,
+        maximum_streams: Optional[int] = None,
+    ) -> "PriorityTree":
+        """
+        Validate a snapshot and return a new tree containing its full state.
+        """
+        return cls.from_dict(snapshot, maximum_streams=maximum_streams)
+
+    def import_state(self, snapshot: Any) -> None:
+        """
+        Replace this tree's state with a fully validated snapshot.
+
+        Validation completes before this tree is mutated, so an invalid
+        snapshot leaves the receiving tree unchanged.
+        """
+        restored = self.restore_state(snapshot, self._maximum_streams)
+        self._root_stream = restored._root_stream
+        self._streams = restored._streams
+        self._maximum_streams = restored._maximum_streams
 
     def _get_or_insert_parent(self, parent_stream_id: int) -> Stream:
         """
@@ -429,6 +778,7 @@ class PriorityTree:
         if cycle:
             new_parent.parent.remove_child(  # type: ignore[union-attr]
                 new_parent,
+                strip_children=False,
             )
             current_stream.parent.add_child(  # type: ignore[union-attr]
                 new_parent,
