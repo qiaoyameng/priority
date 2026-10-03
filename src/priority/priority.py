@@ -6,9 +6,11 @@ priority/tree
 Implementation of the Priority tree data structure.
 """
 
+import copy
 import heapq
+from dataclasses import dataclass
 
-from typing import List, Tuple, Optional
+from typing import Any, Iterable, List, Mapping, Optional, Tuple, Union
 
 
 class PriorityError(Exception):
@@ -129,7 +131,9 @@ class Stream:
 
         :param child: A ``Stream`` object that exclusively depends on this one.
         """
-        old_children = self.children
+        old_children = [
+            old_child for old_child in self.children if old_child != child
+        ]
         self.children = []
         self.child_queue = []
         self.last_weight = 0
@@ -251,6 +255,24 @@ class Stream:
         return self.stream_id >= other.stream_id
 
 
+@dataclass(frozen=True)
+class PriorityUpdate:
+    """
+    A single priority change in a batch update.
+
+    :param stream_id: The ID of the stream being updated.
+    :param depends_on: The ID of the stream it now depends on. ``None`` or
+        ``0`` means the root stream.
+    :param weight: The new weight for the stream.
+    :param exclusive: Whether the dependency is exclusive.
+    """
+
+    stream_id: int
+    depends_on: Optional[int] = None
+    weight: int = 16
+    exclusive: bool = False
+
+
 def _stream_cycle(new_parent: Stream, current: Stream) -> bool:
     """
     Reports whether the new parent depends on the current stream.
@@ -335,6 +357,86 @@ class PriorityTree:
         semantics of exclusive insertion.
         """
         parent_stream.add_child_exclusive(inserted_stream)
+
+    @staticmethod
+    def _parse_priority_update(
+        update: Union[PriorityUpdate, Mapping[str, Any], Tuple[Any, ...]]
+    ) -> PriorityUpdate:
+        """
+        Return a batch update as a PriorityUpdate.
+        """
+        if isinstance(update, PriorityUpdate):
+            return update
+
+        if isinstance(update, Mapping):
+            try:
+                stream_id = update["stream_id"]
+            except KeyError:
+                raise TypeError("Priority updates must contain a stream_id")
+
+            return PriorityUpdate(
+                stream_id=stream_id,
+                depends_on=update.get("depends_on"),
+                weight=update.get("weight", 16),
+                exclusive=update.get("exclusive", False),
+            )
+
+        if isinstance(update, tuple):
+            if not 1 <= len(update) <= 4:
+                raise TypeError("Priority update tuples may contain 1 to 4 fields")
+
+            stream_id = update[0]
+            depends_on = update[1] if len(update) >= 2 else None
+            weight = update[2] if len(update) >= 3 else 16
+            exclusive = update[3] if len(update) >= 4 else False
+            return PriorityUpdate(
+                stream_id=stream_id,
+                depends_on=depends_on,
+                weight=weight,
+                exclusive=exclusive,
+            )
+
+        raise TypeError(
+            "Priority updates must be PriorityUpdate objects, mappings, or tuples"
+        )
+
+    def _validate_priority_tree(self) -> None:
+        """
+        Ensure that all streams form one consistent tree rooted at stream 0.
+        """
+        root = self._root_stream
+
+        if self._streams.get(0) is not root or root.parent is not None:
+            raise PriorityLoop("Priority tree does not have a single root")
+
+        seen = {0}
+        pending = [root]
+
+        while pending:
+            stream = pending.pop()
+            child_ids = {id(child) for child in stream.children}
+            queued_ids = {id(child) for _, child in stream.child_queue}
+
+            if child_ids != queued_ids or len(stream.child_queue) != len(
+                stream.children
+            ):
+                raise PriorityLoop("Priority tree child queues are inconsistent")
+
+            for child in stream.children:
+                if child.parent is not stream:
+                    raise PriorityLoop("Priority tree parent links are inconsistent")
+                if child.stream_id in seen:
+                    raise PriorityLoop(
+                        "Stream %d is in a priority loop." % child.stream_id
+                    )
+                if self._streams.get(child.stream_id) is not child:
+                    raise PriorityLoop("Priority tree contains an unknown stream")
+
+                seen.add(child.stream_id)
+                pending.append(child)
+
+        if seen != set(self._streams):
+            raise PriorityLoop("Priority tree contains an unreachable stream")
 
     def insert_stream(
         self,
@@ -442,6 +544,87 @@ class PriorityTree:
             new_parent.add_child_exclusive(current_stream)
         else:
             new_parent.add_child(current_stream)
+
+    def reprioritize_many(
+        self,
+        updates: Iterable[
+            Union[PriorityUpdate, Mapping[str, Any], Tuple[Any, ...]]
+        ],
+        *,
+        create_missing_parents: bool = True,
+    ) -> None:
+        """
+        Apply a batch of priority updates atomically.
+
+        Updates are interpreted in their given order. In particular, an
+        exclusive update moves all children currently attached to its new
+        parent, including children moved there by earlier updates in the same
+        batch.
+
+        :param updates: An iterable of :class:`PriorityUpdate` objects or
+            mappings with ``stream_id``, ``depends_on``, ``weight`` and
+            ``exclusive`` keys.
+        :param create_missing_parents: Whether to insert blocked placeholder
+            streams for parent IDs that are not already present. If ``False``,
+            a missing parent raises :class:`MissingStreamError`.
+        """
+        adjustments = [self._parse_priority_update(update) for update in updates]
+
+        for adjustment in adjustments:
+            if adjustment.stream_id == 0:
+                raise PseudoStreamError("Cannot reprioritize stream 0")
+            if adjustment.stream_id not in self._streams:
+                raise MissingStreamError(
+                    "Stream %d not in tree" % adjustment.stream_id
+                )
+
+        missing_parent_ids = []
+
+        for adjustment in adjustments:
+            Stream(adjustment.stream_id, adjustment.weight)
+
+            parent_id = adjustment.depends_on or 0
+            if parent_id == adjustment.stream_id:
+                raise PriorityLoop(
+                    "Stream %d must not depend on itself" % adjustment.stream_id
+                )
+
+            if parent_id not in self._streams:
+                if not create_missing_parents:
+                    raise MissingStreamError(
+                        "Stream %d not in tree" % parent_id
+                    )
+                if parent_id not in missing_parent_ids:
+                    missing_parent_ids.append(parent_id)
+
+        if len(self._streams) + len(missing_parent_ids) > self._maximum_streams:
+            raise TooManyStreamsError(
+                "Refusing to insert more than %d streams into priority tree"
+                % self._maximum_streams
+            )
+
+        candidate = copy.deepcopy(self)
+
+        for parent_id in missing_parent_ids:
+            candidate.insert_stream(parent_id)
+            candidate.block(parent_id)
+
+        for adjustment in adjustments:
+            candidate.reprioritize(
+                stream_id=adjustment.stream_id,
+                depends_on=adjustment.depends_on,
+                weight=adjustment.weight,
+                exclusive=adjustment.exclusive,
+            )
+
+        candidate._validate_priority_tree()
+
+        self._root_stream = candidate._root_stream
+        self._streams = candidate._streams
+
+    batch_reprioritize = reprioritize_many
+    bulk_reprioritize = reprioritize_many
+    reprioritize_batch = reprioritize_many
 
     def remove_stream(self, stream_id: int) -> None:
         """

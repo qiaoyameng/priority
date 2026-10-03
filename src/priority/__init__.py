@@ -4,6 +4,7 @@ priority: HTTP/2 priority implementation for Python
 """
 from .priority import (  # noqa
     Stream,
+    PriorityUpdate,
     PriorityTree,
     DeadlockError,
     PriorityLoop,

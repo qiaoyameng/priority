@@ -75,6 +75,32 @@ update the tree in the wake of that change.
 signature as :meth:`insert_stream <priority.PriorityTree.insert_stream>`, but
 applies only to streams already in the tree.
 
+When the control plane delivers several priority changes together, use
+:meth:`reprioritize_many <priority.PriorityTree.reprioritize_many>`. The whole
+batch is validated before the tree is changed, so missing streams, invalid
+weights, self dependencies, capacity limits, or a final invalid tree leave the
+existing scheduling heap, accumulated weights, and deficits untouched. Updates
+are applied in list order; this is significant for exclusive dependencies,
+because an exclusive update moves the children currently attached to its new
+parent.
+
+By default, missing parent IDs are inserted as blocked placeholder streams,
+just as they are for individual updates. Pass
+``create_missing_parents=False`` to reject them with
+:class:`MissingStreamError <priority.MissingStreamError>` instead.
+
+.. code-block:: python
+
+    >>> p.reprioritize_many(
+    ...     [
+    ...         priority.PriorityUpdate(stream_id=5, depends_on=1, weight=32),
+    ...         priority.PriorityUpdate(
+    ...             stream_id=7, depends_on=5, exclusive=True
+    ...         ),
+    ...     ],
+    ...     create_missing_parents=False,
+    ... )
+
 Removing Streams
 ----------------
 

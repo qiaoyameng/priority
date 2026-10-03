@@ -107,6 +107,14 @@ Additionally, the priority of a stream may change. When it does, the
 change. ``reprioritize`` has the same signature as ``insert_stream``, but
 applies only to streams already in the tree.
 
+Multiple changes arriving together can be passed to ``reprioritize_many``.
+That method validates and applies the full batch atomically: failed batches
+leave the scheduling heap, accumulated weights, and deficits unchanged.
+Updates are interpreted in list order, which determines how exclusive
+dependencies reparent streams. Missing parent IDs are created as blocked
+placeholder streams by default; pass ``create_missing_parents=False`` to
+reject them instead.
+
 Removing Streams
 ~~~~~~~~~~~~~~~~
 

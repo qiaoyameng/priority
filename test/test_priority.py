@@ -8,6 +8,7 @@ Tests for the Priority trees
 
 import operator
 import collections
+import copy
 import itertools
 
 import pytest
@@ -251,6 +252,225 @@ class TestPriorityTreeManual:
 
         actual_result = [next(t) for _ in range(len(result))]
         assert actual_result == result
+
+    def test_reprioritize_many_is_atomic_for_invalid_batch(self):
+        """
+        A batch that fails after an earlier valid update leaves scheduling
+        exactly where it was.
+        """
+        changed = readme_tree()
+        unchanged = copy.deepcopy(changed)
+
+        for _ in range(23):
+            selected_id = next(changed)
+            next(unchanged)
+
+        with pytest.raises(priority.MissingStreamError):
+            changed.reprioritize_many(
+                [
+                    {"stream_id": 7, "depends_on": 1, "weight": 32},
+                    {"stream_id": 99, "depends_on": 3},
+                ]
+            )
+
+        changed_sequence = [next(changed) for _ in range(200)]
+        unchanged_sequence = [next(unchanged) for _ in range(200)]
+        assert changed_sequence == unchanged_sequence
+        assert selected_id == changed_sequence[0]
+
+    def test_reprioritize_many_can_create_missing_parents(self):
+        """
+        Missing parents can be inserted as blocked placeholders atomically.
+        """
+        p = priority.PriorityTree()
+        p.insert_stream(3)
+
+        p.reprioritize_many(
+            [
+                priority.PriorityUpdate(
+                    stream_id=3,
+                    depends_on=1,
+                    weight=32,
+                    exclusive=True,
+                )
+            ]
+        )
+
+        assert p._streams[1].active is False
+        assert p._streams[3].parent is p._streams[1]
+        assert [next(p) for _ in range(10)] == [3] * 10
+
+    def test_reprioritize_many_can_reject_missing_parents(self):
+        """
+        Callers may request that missing parents not be created.
+        """
+        p = priority.PriorityTree()
+        p.insert_stream(3)
+
+        with pytest.raises(priority.MissingStreamError):
+            p.reprioritize_many(
+                [{"stream_id": 3, "depends_on": 1}],
+                create_missing_parents=False,
+            )
+
+        assert set(p._streams) == {0, 3}
+
+    def test_reprioritize_many_accepts_tuple_updates(self):
+        """
+        Batch updates may use the compact ``(id, parent, weight, exclusive)``
+        tuple form.
+        """
+        p = priority.PriorityTree()
+        p.insert_stream(1)
+        p.insert_stream(3)
+
+        p.reprioritize_many(
+            [(3, 1, 32, True)],
+            create_missing_parents=False,
+        )
+
+        assert p._streams[3].parent is p._streams[1]
+        assert p._streams[3].weight == 32
+
+    def test_reprioritize_many_respects_capacity(self):
+        """
+        Placeholder parents required by a valid batch count toward capacity.
+        """
+        p = priority.PriorityTree(maximum_streams=4)
+        p.insert_stream(1)
+        p.insert_stream(3)
+        p.insert_stream(5)
+
+        with pytest.raises(priority.TooManyStreamsError):
+            p.reprioritize_many(
+                [
+                    {"stream_id": 1, "depends_on": 7},
+                    {"stream_id": 3, "depends_on": 9},
+                ]
+            )
+
+        assert set(p._streams) == {0, 1, 3, 5}
+
+    def test_reprioritize_many_applies_parents_weights_and_exclusive_order(self):
+        """
+        Successful batches produce the requested final tree and weights, using
+        update order to resolve exclusive reparenting.
+        """
+        p = priority.PriorityTree()
+        p.insert_stream(1)
+        p.insert_stream(2)
+        p.insert_stream(3)
+
+        p.reprioritize_many(
+            [
+                {"stream_id": 1, "exclusive": True},
+                {
+                    "stream_id": 3,
+                    "depends_on": 1,
+                    "weight": 32,
+                    "exclusive": True,
+                },
+                priority.PriorityUpdate(stream_id=2, depends_on=3, weight=8),
+            ]
+        )
+
+        assert p._streams[1].parent is p._streams[0]
+        assert p._streams[3].parent is p._streams[1]
+        assert p._streams[2].parent is p._streams[3]
+        assert p._streams[1].weight == 16
+        assert p._streams[2].weight == 8
+        assert p._streams[3].weight == 32
+
+    def test_reprioritize_many_preserves_fairness_for_unaffected_streams(self):
+        """
+        Unrelated streams retain accumulated scheduling state after a batch.
+        """
+        p = priority.PriorityTree()
+        p.insert_stream(1, weight=7)
+        p.insert_stream(3, weight=11)
+        p.insert_stream(5, weight=13)
+
+        for _ in range(50):
+            next(p)
+
+        def queue_level(stream_id):
+            for level, child in p._streams[0].child_queue:
+                if child.stream_id == stream_id:
+                    return level
+
+        stream_three_level = queue_level(3)
+        stream_three_deficit = p._streams[3]._deficit
+        root_last_weight = p._streams[0].last_weight
+
+        p.reprioritize_many(
+            [{"stream_id": 1, "depends_on": 5, "weight": 32}],
+            create_missing_parents=False,
+        )
+
+        assert queue_level(3) == stream_three_level
+        assert p._streams[3]._deficit == stream_three_deficit
+        assert p._streams[0].last_weight == root_last_weight
+        assert p._streams[1]._deficit == p._streams[5].children[0]._deficit
+
+    @pytest.mark.parametrize("exclusive", (True, False))
+    def test_reprioritize_many_rejects_self_dependency_without_mutation(
+        self, exclusive
+    ):
+        """
+        Self dependency is detected before any tree or scheduling state change.
+        """
+        changed = readme_tree()
+        unchanged = copy.deepcopy(changed)
+        next(changed)
+        next(unchanged)
+
+        with pytest.raises(priority.PriorityLoop):
+            changed.reprioritize_many(
+                [
+                    {"stream_id": 7, "depends_on": 1, "weight": 32},
+                    {"stream_id": 11, "depends_on": 11, "exclusive": exclusive},
+                ]
+            )
+
+        assert [next(changed) for _ in range(100)] == [
+            next(unchanged) for _ in range(100)
+        ]
+
+    def test_reprioritize_many_rejects_bad_weight_without_mutation(self):
+        """
+        Weight validation happens before any partial batch is committed.
+        """
+        changed = readme_tree()
+        unchanged = copy.deepcopy(changed)
+
+        with pytest.raises(priority.BadWeightError):
+            changed.reprioritize_many(
+                [
+                    {"stream_id": 7, "weight": 32},
+                    {"stream_id": 3, "weight": 257},
+                ]
+            )
+
+        assert [next(changed) for _ in range(100)] == [
+            next(unchanged) for _ in range(100)
+        ]
+
+    def test_reprioritize_many_allows_exclusive_update_of_current_child(self):
+        """
+        Making a current direct child exclusive does not attach it to itself.
+        """
+        p = priority.PriorityTree()
+        p.insert_stream(1)
+        p.insert_stream(3)
+
+        p.reprioritize_many(
+            [{"stream_id": 1, "exclusive": True}],
+            create_missing_parents=False,
+        )
+
+        assert p._streams[1].parent is p._streams[0]
+        assert p._streams[3].parent is p._streams[1]
+        assert p._streams[1].children == [p._streams[3]]
 
     def test_priority_tree_raises_error_inserting_duplicate(self):
         """
