@@ -107,6 +107,14 @@ Additionally, the priority of a stream may change. When it does, the
 change. ``reprioritize`` has the same signature as ``insert_stream``, but
 applies only to streams already in the tree.
 
+Multiple priority changes can also be applied atomically with
+``reprioritize_batch``. The updates are interpreted in their supplied order,
+which determines how consecutive exclusive updates nest streams. If any stream
+is missing, a stream depends on itself, the tree would exceed its stream limit,
+or the final dependency graph contains a loop, the old tree is left unchanged.
+Missing parent streams are created as blocked placeholders by default; pass
+``create_missing_parents=False`` to reject those updates instead.
+
 Removing Streams
 ~~~~~~~~~~~~~~~~
 

@@ -75,6 +75,14 @@ update the tree in the wake of that change.
 signature as :meth:`insert_stream <priority.PriorityTree.insert_stream>`, but
 applies only to streams already in the tree.
 
+Multiple changes can be applied atomically with
+:meth:`reprioritize_batch <priority.PriorityTree.reprioritize_batch>`. Updates
+are interpreted in their supplied order, so that order also defines how
+consecutive exclusive updates rearrange the tree. Invalid batches leave the
+previous tree, including its scheduling queues and fairness state, completely
+unchanged. Pass ``create_missing_parents=False`` to refuse updates that refer
+to absent parent streams instead of creating blocked placeholders.
+
 Removing Streams
 ----------------
 

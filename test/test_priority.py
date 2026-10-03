@@ -6,9 +6,10 @@ test_priority
 Tests for the Priority trees
 """
 
-import operator
 import collections
+import copy
 import itertools
+import operator
 
 import pytest
 
@@ -54,6 +55,21 @@ def readme_tree():
     p.insert_stream(stream_id=9, depends_on=7, weight=8)
     p.insert_stream(stream_id=11, depends_on=7, exclusive=True)
     return p
+
+
+def scheduler_state(tree):
+    return {
+        stream_id: (
+            stream.weight,
+            stream.active,
+            stream.last_weight,
+            stream._deficit,
+            stream.parent.stream_id if stream.parent is not None else None,
+            tuple(child.stream_id for child in stream.children),
+            tuple((level, child.stream_id) for level, child in stream.child_queue),
+        )
+        for stream_id, stream in tree._streams.items()
+    }
 
 
 def active_readme_streams_from_filter(
@@ -251,6 +267,201 @@ class TestPriorityTreeManual:
 
         actual_result = [next(t) for _ in range(len(result))]
         assert actual_result == result
+
+    def test_invalid_batch_leaves_entire_tree_unchanged(self):
+        original = readme_tree()
+        for _ in range(7):
+            next(original)
+
+        failed = copy.deepcopy(original)
+        untouched = copy.deepcopy(original)
+
+        with pytest.raises(priority.PriorityLoop):
+            failed.reprioritize_batch(
+                [
+                    {"stream_id": 1, "depends_on": 3, "weight": 32},
+                    {"stream_id": 5, "depends_on": 5},
+                ]
+            )
+
+        assert scheduler_state(failed) == scheduler_state(untouched)
+
+        failed_sequence = [next(failed) for _ in range(80)]
+        untouched_sequence = [next(untouched) for _ in range(80)]
+        assert failed_sequence == untouched_sequence
+
+    @pytest.mark.parametrize(
+        "updates,expected_error",
+        [
+            (
+                [{"stream_id": 13, "depends_on": 1}],
+                priority.MissingStreamError,
+            ),
+            (
+                [{"stream_id": 1, "depends_on": 1}],
+                priority.PriorityLoop,
+            ),
+            (
+                [{"stream_id": 1, "depends_on": 13}],
+                priority.MissingStreamError,
+            ),
+            (
+                [{"stream_id": 1, "weight": 257}],
+                priority.BadWeightError,
+            ),
+        ],
+    )
+    def test_invalid_batch_does_not_partially_apply(
+        self, updates, expected_error
+    ):
+        tree = readme_tree()
+
+        with pytest.raises(expected_error):
+            tree.reprioritize_batch(
+                updates, create_missing_parents=False
+            )
+
+        assert tree._streams.keys() == readme_tree()._streams.keys()
+
+    def test_batch_rejects_final_topology_loop_without_rewriting(self):
+        tree = priority.PriorityTree()
+        tree.insert_stream(1)
+        tree.insert_stream(3)
+
+        with pytest.raises(priority.PriorityLoop):
+            tree.reprioritize_batch(
+                [
+                    {"stream_id": 1, "depends_on": 3},
+                    {"stream_id": 3, "depends_on": 1},
+                ]
+            )
+
+        assert tree._streams[1].parent is tree._root_stream
+        assert tree._streams[3].parent is tree._root_stream
+        assert [
+            child.stream_id for child in tree._root_stream.children
+        ] == [1, 3]
+
+    def test_batch_respects_capacity_for_placeholder_parents(self):
+        tree = priority.PriorityTree(maximum_streams=3)
+        tree.insert_stream(1)
+
+        with pytest.raises(priority.TooManyStreamsError):
+            tree.reprioritize_batch(
+                [
+                    {"stream_id": 1, "depends_on": 3},
+                    {"stream_id": 1, "depends_on": 5},
+                ]
+            )
+
+        assert set(tree._streams) == {0, 1}
+
+    def test_batch_applies_parent_and_weight_updates(self):
+        tree = readme_tree()
+
+        tree.reprioritize_batch(
+            [
+                {"stream_id": 5, "depends_on": 3, "weight": 32},
+                {"stream_id": 11, "depends_on": 1, "weight": 8},
+            ]
+        )
+
+        assert tree._streams[5].parent is tree._streams[3]
+        assert tree._streams[5].weight == 32
+        assert tree._streams[11].parent is tree._streams[1]
+        assert tree._streams[11].weight == 8
+        assert tree._streams[9].parent is tree._streams[11]
+        assert [
+            child.stream_id for child in tree._root_stream.children
+        ] == [1, 3, 7]
+
+    def test_batch_interprets_exclusive_updates_in_order(self):
+        first_order = priority.PriorityTree()
+        for stream_id in (1, 3, 5, 7):
+            first_order.insert_stream(stream_id)
+
+        second_order = copy.deepcopy(first_order)
+
+        first_order.reprioritize_batch(
+            [
+                {"stream_id": 3, "depends_on": 1, "exclusive": True},
+                {"stream_id": 7, "depends_on": 1, "exclusive": True},
+            ]
+        )
+        second_order.reprioritize_batch(
+            [
+                {"stream_id": 7, "depends_on": 1, "exclusive": True},
+                {"stream_id": 3, "depends_on": 1, "exclusive": True},
+            ]
+        )
+
+        assert first_order._streams[3].parent is first_order._streams[7]
+        assert first_order._streams[7].parent is first_order._streams[1]
+        assert second_order._streams[7].parent is second_order._streams[3]
+        assert second_order._streams[3].parent is second_order._streams[1]
+
+    def test_batch_preserves_fairness_state_for_unaffected_streams(self):
+        tree = priority.PriorityTree()
+        tree.insert_stream(1)
+        tree.insert_stream(3)
+        tree.insert_stream(5)
+
+        for _ in range(5):
+            next(tree)
+
+        unaffected_before = {
+            stream_id: (
+                tree._streams[stream_id]._deficit,
+                [
+                    (level, child.stream_id)
+                    for level, child in tree._root_stream.child_queue
+                    if child.stream_id == stream_id
+                ][0],
+            )
+            for stream_id in (3, 5)
+        }
+        moved_deficit = tree._streams[1]._deficit
+
+        tree.reprioritize_batch(
+            [{"stream_id": 1, "depends_on": 0, "weight": 32}]
+        )
+
+        unaffected_after = {
+            stream_id: (
+                tree._streams[stream_id]._deficit,
+                [
+                    (level, child.stream_id)
+                    for level, child in tree._root_stream.child_queue
+                    if child.stream_id == stream_id
+                ][0],
+            )
+            for stream_id in (3, 5)
+        }
+        assert unaffected_after == unaffected_before
+        assert tree._streams[1]._deficit == moved_deficit
+
+    def test_batch_can_create_blocked_placeholder_parents(self):
+        tree = priority.PriorityTree()
+        tree.insert_stream(1)
+
+        tree.reprioritize_batch([{"stream_id": 1, "depends_on": 3}])
+
+        assert tree._streams[3].active is False
+        assert tree._streams[1].parent is tree._streams[3]
+        assert tree._streams[3].parent is tree._root_stream
+
+    def test_batch_can_refuse_placeholder_parents(self):
+        tree = priority.PriorityTree()
+        tree.insert_stream(1)
+
+        with pytest.raises(priority.MissingStreamError):
+            tree.reprioritize_batch(
+                [{"stream_id": 1, "depends_on": 3}],
+                create_missing_parents=False,
+            )
+
+        assert set(tree._streams) == {0, 1}
+        assert tree._streams[1].parent is tree._root_stream
 
     def test_priority_tree_raises_error_inserting_duplicate(self):
         """
