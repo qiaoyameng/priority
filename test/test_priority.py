@@ -614,3 +614,287 @@ class PriorityStateMachine(RuleBasedStateMachine):
 
 
 TestPriorityTreeStateful = PriorityStateMachine.TestCase
+
+
+class TestCostBasedScheduling:
+    """
+    Tests for the grant-based scheduling interface (``next_grant`` /
+    ``settle`` / ``return_grant``), which charges each scheduling
+    opportunity its real cost in bytes instead of a fixed quantum.
+    """
+
+    def _two_stream_tree(self):
+        p = priority.PriorityTree()
+        p.insert_stream(stream_id=1, weight=16)
+        p.insert_stream(stream_id=2, weight=16)
+        return p
+
+    def test_byte_shares_match_weights_with_unequal_frames(self):
+        """
+        Two streams with equal weights but very different fixed frame sizes
+        (1 KB vs 64 KB) must still converge to equal byte shares.
+        """
+        p = self._two_stream_tree()
+        frames = {1: 1024, 2: 64 * 1024}
+        sent = collections.Counter()
+
+        for _ in range(5000):
+            stream_id = p.next_grant()
+            p.settle(stream_id, frames[stream_id])
+            sent[stream_id] += frames[stream_id]
+
+        total = sent[1] + sent[2]
+        assert abs(sent[1] / total - 0.5) < 0.02
+        assert abs(sent[2] / total - 0.5) < 0.02
+
+    def test_next_interface_does_not_balance_unequal_frames(self):
+        """
+        Characterisation test motivating the grant interface: the plain
+        ``next`` interface allocates opportunities, not bytes, so a stream
+        sending 64 KB frames dominates one sending 1 KB frames.
+        """
+        p = self._two_stream_tree()
+        frames = {1: 1024, 2: 64 * 1024}
+        sent = collections.Counter()
+
+        for _ in range(1000):
+            stream_id = next(p)
+            sent[stream_id] += frames[stream_id]
+
+        assert sent[2] > 10 * sent[1]
+
+    def test_long_run_byte_shares_follow_weight_ratio(self):
+        """
+        Over a long sequence of unequal fixed-size frames, cumulative byte
+        shares converge to the weight ratios.
+        """
+        weights = {1: 8, 2: 16, 3: 32, 4: 64}
+        frames = {1: 64 * 1024, 2: 1024, 3: 1500, 4: 997}
+        p = priority.PriorityTree()
+        for stream_id, weight in weights.items():
+            p.insert_stream(stream_id=stream_id, weight=weight)
+
+        sent = collections.Counter()
+        for _ in range(20000):
+            stream_id = p.next_grant()
+            p.settle(stream_id, frames[stream_id])
+            sent[stream_id] += frames[stream_id]
+
+        total = sum(sent.values())
+        total_weight = sum(weights.values())
+        for stream_id, weight in weights.items():
+            expected = weight / total_weight
+            assert abs(sent[stream_id] / total - expected) < 0.02
+
+    def test_grant_through_blocked_parent(self):
+        """
+        Grants recurse through blocked streams to their active children,
+        and cost settlement keeps those children fair.
+        """
+        p = priority.PriorityTree()
+        p.insert_stream(stream_id=1, weight=16)
+        p.insert_stream(stream_id=3, depends_on=1, weight=16)
+        p.insert_stream(stream_id=5, depends_on=1, weight=16)
+        p.block(1)
+
+        sent = collections.Counter()
+        for _ in range(2000):
+            stream_id = p.next_grant()
+            assert stream_id in (3, 5)
+            p.settle(stream_id, 1500)
+            sent[stream_id] += 1500
+
+        assert abs(sent[3] - sent[5]) <= 3000
+
+    def test_no_second_grant_while_unsettled(self):
+        """
+        A stream with an outstanding grant cannot be granted again, by
+        either interface, until the grant is settled.
+        """
+        p = priority.PriorityTree()
+        for stream_id in (1, 2, 3):
+            p.insert_stream(stream_id=stream_id)
+
+        granted = set()
+        for _ in range(3):
+            stream_id = p.next_grant()
+            assert stream_id not in granted
+            granted.add(stream_id)
+
+        # Every stream has an outstanding grant: nothing can be scheduled.
+        with pytest.raises(priority.DeadlockError):
+            p.next_grant()
+        with pytest.raises(priority.DeadlockError):
+            next(p)
+
+        for stream_id in granted:
+            p.settle(stream_id, 512)
+
+        assert p.next_grant() in granted
+
+    def test_single_stream_deadlocks_until_settled(self):
+        p = priority.PriorityTree()
+        p.insert_stream(stream_id=1)
+
+        assert p.next_grant() == 1
+        with pytest.raises(priority.DeadlockError):
+            p.next_grant()
+
+        p.settle(1, 100)
+        assert p.next_grant() == 1
+
+    def test_double_settle_is_rejected(self):
+        p = self._two_stream_tree()
+        stream_id = p.next_grant()
+        p.settle(stream_id, 100)
+        with pytest.raises(priority.MissingGrantError):
+            p.settle(stream_id, 100)
+
+    def test_settle_without_grant_is_rejected(self):
+        p = self._two_stream_tree()
+        with pytest.raises(priority.MissingGrantError):
+            p.settle(1, 100)
+        with pytest.raises(priority.MissingStreamError):
+            p.settle(99, 100)
+
+    @pytest.mark.parametrize("cost", [-1, -65536, 1.5, "100", None, True])
+    def test_invalid_cost_is_rejected_and_grant_survives(self, cost):
+        p = self._two_stream_tree()
+        stream_id = p.next_grant()
+        with pytest.raises(priority.BadCostError):
+            p.settle(stream_id, cost)
+
+        # The failed settlement did not consume the grant.
+        p.settle(stream_id, 100)
+        with pytest.raises(priority.MissingGrantError):
+            p.settle(stream_id, 100)
+
+    def test_zero_cost_returns_grant_unused(self):
+        """
+        Settling with a zero cost is allowed: the stream sent nothing and
+        resumes its former position at the front of the schedule.
+        """
+        p = self._two_stream_tree()
+        first = p.next_grant()
+        p.settle(first, 0)
+        assert p.next_grant() == first
+
+    def test_return_grant_is_a_zero_cost_settle(self):
+        p = self._two_stream_tree()
+        first = p.next_grant()
+        p.return_grant(first)
+        assert p.next_grant() == first
+        p.return_grant(first)
+        with pytest.raises(priority.MissingGrantError):
+            p.return_grant(first)
+
+    def test_remove_between_grant_and_settle_leaves_no_debt(self):
+        """
+        A stream removed while its grant is outstanding can still be
+        settled, and leaves no residual debt that distorts the shares of
+        the remaining streams.
+        """
+        p = priority.PriorityTree()
+        for stream_id in (1, 2, 3):
+            p.insert_stream(stream_id=stream_id, weight=16)
+        frames = {1: 1024, 2: 64 * 1024, 3: 8192}
+        sent = collections.Counter()
+
+        # Schedule until stream 2 holds an outstanding grant.
+        while True:
+            stream_id = p.next_grant()
+            if stream_id == 2:
+                break
+            p.settle(stream_id, frames[stream_id])
+            sent[stream_id] += frames[stream_id]
+
+        # Remove the stream, then settle its outstanding grant.
+        p.remove_stream(2)
+        p.settle(2, frames[2])
+
+        # No residual state may reference the removed stream.
+        assert not p._outstanding_grants
+        for stream in p._streams.values():
+            for _, child in stream.child_queue:
+                assert child.stream_id != 2
+
+        # Settling it again is an error: the grant is gone for good.
+        with pytest.raises(priority.MissingStreamError):
+            p.settle(2, frames[2])
+
+        # The surviving streams still converge to equal byte shares.
+        for _ in range(5000):
+            stream_id = p.next_grant()
+            p.settle(stream_id, frames[stream_id])
+            sent[stream_id] += frames[stream_id]
+
+        total = sent[1] + sent[3]
+        assert abs(sent[1] / total - 0.5) < 0.05
+        assert abs(sent[3] / total - 0.5) < 0.05
+
+    def test_block_and_unblock_between_grant_and_settle(self):
+        p = self._two_stream_tree()
+        first = p.next_grant()
+        p.block(first)
+        p.settle(first, 1024)
+
+        # The blocked stream is not selected even though it is settled.
+        second = p.next_grant()
+        assert second != first
+        p.settle(second, 1024)
+
+        p.unblock(first)
+        assert p.next_grant() == first
+
+    def test_reprioritize_between_grant_and_settle(self):
+        """
+        Re-attaching a stream elsewhere in the tree while its grant is
+        outstanding charges the cost against its new position, and the
+        stream is never present twice in any queue.
+        """
+        p = priority.PriorityTree()
+        p.insert_stream(stream_id=1, weight=16)
+        p.insert_stream(stream_id=2, weight=16)
+        p.insert_stream(stream_id=3, weight=16)
+        p.block(3)
+
+        assert p.next_grant() == 1
+        p.reprioritize(1, depends_on=3, weight=16)
+        p.settle(1, 1024)
+
+        assert p.next_grant() == 2
+        p.settle(2, 1024)
+        # Stream 1 is reachable again through its new (blocked) parent.
+        assert p.next_grant() == 1
+        p.settle(1, 1024)
+
+        for stream in p._streams.values():
+            queued = [child.stream_id for _, child in stream.child_queue]
+            assert len(queued) == len(set(queued))
+
+    def test_next_and_grant_interfaces_can_be_mixed(self):
+        """
+        The two interfaces share the same scheduling queues: a stream with
+        an outstanding grant is invisible to ``next`` as well, and both
+        interfaces keep working when interleaved.
+        """
+        p = self._two_stream_tree()
+        granted = p.next_grant()
+
+        via_next = next(p)
+        assert via_next != granted
+
+        p.settle(granted, 256)
+        assert next(p) in (1, 2)
+
+        stream_id = p.next_grant()
+        p.return_grant(stream_id)
+        assert p.next_grant() == stream_id
+        p.settle(stream_id, 0)
+
+    def test_deadlock_when_all_blocked(self):
+        p = self._two_stream_tree()
+        p.block(1)
+        p.block(2)
+        with pytest.raises(priority.DeadlockError):
+            p.next_grant()

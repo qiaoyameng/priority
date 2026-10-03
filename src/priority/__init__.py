@@ -13,6 +13,8 @@ from .priority import (  # noqa
     TooManyStreamsError,
     BadWeightError,
     PseudoStreamError,
+    BadCostError,
+    MissingGrantError,
 )
 
 

@@ -1,6 +1,22 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+**API Changes**
+
+- Added a grant-based scheduling interface (``PriorityTree.next_grant``,
+  ``PriorityTree.settle`` and ``PriorityTree.return_grant``) that charges
+  each scheduling opportunity its real cost in bytes, so that streams
+  sending frames of different sizes still receive bandwidth in proportion
+  to their weights. The original ``next`` interface is unchanged and may be
+  mixed with the new one.
+- Added ``BadCostError``, raised when settling a grant with a negative or
+  non-integer cost.
+- Added ``MissingGrantError``, raised when settling a grant that was never
+  issued or was already settled.
+
 2.0.0 (2021-06-27)
 ------------------
 

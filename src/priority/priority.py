@@ -8,7 +8,7 @@ Implementation of the Priority tree data structure.
 
 import heapq
 
-from typing import List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 
 
 class PriorityError(Exception):
@@ -81,6 +81,23 @@ class PseudoStreamError(PriorityError):
     pass
 
 
+class BadCostError(PriorityError):
+    """
+    An attempt was made to settle a grant with an invalid cost.
+    """
+
+    pass
+
+
+class MissingGrantError(PriorityError):
+    """
+    An attempt was made to settle a grant that was never issued, or that has
+    already been settled.
+    """
+
+    pass
+
+
 class Stream:
     """
     Priority information for a given stream.
@@ -98,6 +115,9 @@ class Stream:
         self.active = True
         self.last_weight = 0
         self._deficit = 0
+        self._grant_outstanding = False
+        self._grant_parent: Optional[Stream] = None
+        self._pending_level = 0
 
     @property
     def weight(self) -> int:
@@ -121,6 +141,10 @@ class Stream:
         """
         child.parent = self
         self.children.append(child)
+        if child._grant_outstanding:
+            # A stream with an outstanding grant must not be present in any
+            # scheduling queue: it is re-inserted when the grant is settled.
+            return
         heapq.heappush(self.child_queue, (self.last_weight, child))
 
     def add_child_exclusive(self, child: "Stream") -> None:
@@ -211,6 +235,83 @@ class Stream:
                 heapq.heappush(self.child_queue, (level, child))
 
         return next_stream
+
+    def schedule_grant(self) -> int:
+        """
+        Returns the stream ID of the next child to schedule, and takes out a
+        grant on it. The selected stream is held out of every scheduling
+        queue until the grant is settled with the real cost of the data that
+        was sent. Potentially recurses down the tree of priorities.
+        """
+        # Cannot be called on active streams.
+        assert not self.active
+
+        next_stream = None
+        popped_streams = []
+
+        # Spin looking for the next active stream. Everything we pop off has
+        # to be rescheduled, even if it turns out none of them were active at
+        # this time. The stream the grant is issued for is the exception: it
+        # stays out of the queue until its grant is settled.
+        try:
+            while next_stream is None:
+                # If the queue is empty, immediately fail.
+                val = heapq.heappop(self.child_queue)
+                level, child = val
+
+                if child.active:
+                    next_stream = child.stream_id
+                    child._grant_outstanding = True
+                    child._grant_parent = self
+                    child._pending_level = level
+                    self.last_weight = level
+                else:
+                    popped_streams.append(val)
+                    # Guard against the possibility that the child also has no
+                    # suitable children.
+                    try:
+                        next_stream = child.schedule_grant()
+                    except IndexError:
+                        continue
+        finally:
+            for level, child in popped_streams:
+                self.last_weight = level
+                level += (256 + child._deficit) // child.weight
+                child._deficit = (256 + child._deficit) % child.weight
+                heapq.heappush(self.child_queue, (level, child))
+
+        return next_stream
+
+    def _settle_grant(self, cost: int, in_tree: bool) -> None:
+        """
+        Settles an outstanding grant with the real cost of the data sent,
+        re-inserting the stream into its parent's scheduling queue.
+        """
+        grant_parent = self._grant_parent
+        pending_level = self._pending_level
+        self._grant_outstanding = False
+        self._grant_parent = None
+        self._pending_level = 0
+
+        if not in_tree:
+            # The stream was removed from the tree while the grant was
+            # outstanding. The cost is discarded along with the stream so
+            # that no debt is left behind for the remaining streams.
+            self._deficit = 0
+            return
+
+        increment, self._deficit = divmod(cost + self._deficit, self.weight)
+
+        parent = self.parent
+        if parent is grant_parent:
+            level = pending_level + increment
+        else:
+            # The stream was re-attached elsewhere in the tree while waiting
+            # for settlement: charge the cost against the new parent's
+            # current scheduling level.
+            level = parent.last_weight + increment  # type: ignore[union-attr]
+
+        heapq.heappush(parent.child_queue, (level, self))  # type: ignore[union-attr]
 
     # Custom repr
     def __repr__(self) -> str:
@@ -304,6 +405,7 @@ class PriorityTree:
         self._root_stream = Stream(stream_id=0, weight=1)
         self._root_stream.active = False
         self._streams = {0: self._root_stream}
+        self._outstanding_grants: Dict[int, Stream] = {}
 
         if not isinstance(maximum_streams, int):
             raise TypeError("maximum_streams must be an int.")
@@ -500,3 +602,94 @@ class PriorityTree:
 
     def next(self) -> int:  # pragma: no cover
         return self.__next__()
+
+    def next_grant(self) -> int:
+        """
+        Selects the next stream to schedule and takes out a grant on it.
+
+        Unlike :meth:`next <PriorityTree.next>`, which implicitly charges
+        each selected stream a fixed quantum, this method defers the
+        accounting: the caller reports the real number of bytes sent by
+        calling :meth:`settle <PriorityTree.settle>` (or returns the grant
+        unused via :meth:`return_grant <PriorityTree.return_grant>`). This
+        makes the bandwidth share of each stream proportional to its weight
+        even when streams send frames of very different sizes.
+
+        A stream with an outstanding grant is held out of the scheduling
+        queues, so it cannot be selected again (by either this method or
+        :meth:`next <PriorityTree.next>`) until the grant is settled. If the
+        stream is blocked, removed, or re-attached elsewhere in the tree
+        while its grant is outstanding, the grant remains valid and must
+        still be settled: the cost is then charged against the stream's new
+        position, or discarded entirely if the stream is no longer in the
+        tree.
+
+        This interface and :meth:`next <PriorityTree.next>` may be freely
+        mixed on the same tree: both maintain the same scheduling invariants.
+        Note, however, that :meth:`next <PriorityTree.next>` charges a fixed
+        quantum per selection, so byte-level fairness is only guaranteed when
+        all selections go through the grant-based interface.
+
+        :returns: The stream ID of the stream that should next send data.
+        :raises DeadlockError: If there are no unblocked streams to schedule.
+        """
+        try:
+            stream_id = self._root_stream.schedule_grant()
+        except IndexError:
+            raise DeadlockError("No unblocked streams to schedule.")
+
+        self._outstanding_grants[stream_id] = self._streams[stream_id]
+        return stream_id
+
+    def settle(self, stream_id: int, cost: int) -> None:
+        """
+        Settles the outstanding grant for a stream, reporting the real cost
+        of the data that was sent for it.
+
+        The cost is charged against the stream's scheduling position,
+        divided by its weight, so that streams accumulate scheduling debt in
+        proportion to ``cost / weight``. A cost of zero is allowed and means
+        nothing was sent: the grant is returned unused and the stream
+        resumes its former position. Negative or non-integer costs are
+        rejected with :class:`BadCostError <priority.BadCostError>`, and the
+        grant remains outstanding so it can be settled correctly.
+
+        The stream does not need to still be in the tree: if it was removed
+        while the grant was outstanding, the cost is discarded and no
+        residual debt is left behind for the other streams.
+
+        :param stream_id: The ID of the stream whose grant is being settled.
+        :param cost: The number of bytes actually sent for this grant. Must
+            be a non-negative integer.
+        :raises BadCostError: If the cost is negative or not an integer.
+        :raises MissingGrantError: If the stream has no outstanding grant.
+        :raises MissingStreamError: If the stream is unknown to the tree and
+            has no outstanding grant.
+        """
+        if isinstance(cost, bool) or not isinstance(cost, int):
+            raise BadCostError("Cost must be an integer")
+        if cost < 0:
+            raise BadCostError("Cost must not be negative")
+
+        try:
+            stream = self._outstanding_grants.pop(stream_id)
+        except KeyError:
+            if stream_id in self._streams:
+                raise MissingGrantError(
+                    "Stream %d has no outstanding grant" % stream_id
+                )
+            raise MissingStreamError("Stream %d not in tree" % stream_id)
+
+        in_tree = self._streams.get(stream_id) is stream
+        stream._settle_grant(cost, in_tree)
+
+    def return_grant(self, stream_id: int) -> None:
+        """
+        Returns an outstanding grant unused, without charging any cost.
+
+        This is exactly equivalent to calling :meth:`settle
+        <PriorityTree.settle>` with a cost of zero.
+
+        :param stream_id: The ID of the stream whose grant is being returned.
+        """
+        self.settle(stream_id, 0)

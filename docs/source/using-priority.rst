@@ -40,6 +40,37 @@ This looks like this:
 If each stream only sends when it is 'ungated' by this mechanism, the server
 will automatically be emitting stream data in conformance to RFC 7540.
 
+Charging Real Costs
+-------------------
+
+Iterating the tree allocates *opportunities*: each selected stream is
+charged a fixed quantum, regardless of how much data it actually sends. If
+one stream sends 1 KB per turn and another sends 64 KB per turn, their byte
+shares will not follow their weights. For byte-accurate scheduling, use the
+grant-based interface instead:
+
+.. code-block:: python
+
+    >>> stream_id = p.next_grant()      # take out a grant
+    >>> sent = send_data(stream_id)     # send some data
+    >>> p.settle(stream_id, sent)       # report the real cost in bytes
+
+While a grant is outstanding the stream is held out of the schedule, so it
+cannot be selected again until the grant is settled. A grant that ends up
+unused can be returned with :meth:`return_grant
+<priority.PriorityTree.return_grant>` (equivalent to settling with a cost of
+zero). If the stream is blocked, removed, or re-prioritized while its grant
+is outstanding, the grant remains valid and must still be settled: the cost
+is charged against the stream's new position, or discarded entirely if the
+stream has left the tree.
+
+The two interfaces operate on the same scheduling state and may be mixed,
+but note that :meth:`next <priority.PriorityTree.next>` charges a fixed
+quantum per selection, so byte-level fairness is only guaranteed when all
+selections go through :meth:`next_grant
+<priority.PriorityTree.next_grant>` and :meth:`settle
+<priority.PriorityTree.settle>`.
+
 Updating The Tree
 -----------------
 
