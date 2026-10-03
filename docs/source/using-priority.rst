@@ -68,6 +68,23 @@ the sequence. Both the :meth:`block <priority.PriorityTree.block>` and
 :meth:`unblock <priority.PriorityTree.unblock>` methods are idempotent and safe
 to call repeatedly.
 
+Pausing Subtrees
+~~~~~~~~~~~~~~~~
+
+If an upstream connection pauses, call
+:meth:`pause_subtree <priority.PriorityTree.pause_subtree>` on the root of the
+logical flow. The returned
+:class:`SubtreePauseHandle <priority.SubtreePauseHandle>` prevents that stream
+and all of its current descendants from scheduling until ``release`` is
+called. Handles can also be used as context managers.
+
+Pauses may be nested, and each owner releases only its own handle. A pause does
+not change a stream's own blocked state, so releasing a pause will not make an
+individually blocked stream active. Streams may be inserted, removed and
+reprioritized while paused; schedulability is based on each stream's current
+ancestors. Removing a paused root finishes its own handles and promotes its
+children, while handles on nested paused subtrees remain active.
+
 Additionally, the priority of a stream may change. When it does, the
 :meth:`reprioritize <priority.PriorityTree.reprioritize>` method can be used to
 update the tree in the wake of that change.

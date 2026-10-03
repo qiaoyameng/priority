@@ -56,6 +56,21 @@ def readme_tree():
     return p
 
 
+def schedulable_stream_ids(p):
+    """
+    Return the streams that the priority gate can currently select.
+    """
+    stream_ids = set()
+
+    for _ in range(1000):
+        try:
+            stream_ids.add(next(p))
+        except priority.DeadlockError:
+            break
+
+    return stream_ids
+
+
 def active_readme_streams_from_filter(
     filtered: Iterable[int],
     blocked: bool = True,
@@ -210,6 +225,105 @@ class TestPriorityTreeManual:
 
         with pytest.raises(priority.DeadlockError):
             next(tree)
+
+    def test_subtree_pause_tracks_migration_and_preserves_block(self):
+        tree = priority.PriorityTree()
+        tree.insert_stream(stream_id=9)
+        tree.insert_stream(stream_id=1)
+        tree.insert_stream(stream_id=3, depends_on=1)
+        tree.insert_stream(stream_id=5, depends_on=3)
+        tree.insert_stream(stream_id=7, depends_on=3)
+
+        tree.block(1)
+        assert schedulable_stream_ids(tree) == {3, 9}
+
+        outer_pause = tree.pause_subtree(1)
+        assert schedulable_stream_ids(tree) == {9}
+
+        inner_pause = tree.pause_subtree(3)
+        tree.reprioritize(stream_id=5)
+        assert schedulable_stream_ids(tree) == {5, 9}
+
+        tree.insert_stream(stream_id=11, depends_on=3)
+        assert schedulable_stream_ids(tree) == {5, 9}
+
+        assert inner_pause.release()
+        assert schedulable_stream_ids(tree) == {5, 9}
+
+        assert outer_pause.release()
+        assert schedulable_stream_ids(tree) == {3, 5, 9}
+        assert tree._streams[1].active is False
+
+        tree.unblock(1)
+        assert schedulable_stream_ids(tree) == {1, 5, 9}
+
+    def test_nested_pauses_on_same_root_are_released_independently(self):
+        tree = priority.PriorityTree()
+        tree.insert_stream(stream_id=1)
+        tree.insert_stream(stream_id=3, depends_on=1)
+        tree.insert_stream(stream_id=5)
+
+        outer_pause = tree.pause_subtree(1)
+        inner_pause = tree.pause_subtree(1)
+
+        assert schedulable_stream_ids(tree) == {5}
+        assert outer_pause.release()
+        assert schedulable_stream_ids(tree) == {5}
+        assert inner_pause.release()
+        assert schedulable_stream_ids(tree) == {1, 5}
+
+    def test_removing_paused_root_releases_its_handle(self):
+        tree = priority.PriorityTree()
+        tree.insert_stream(stream_id=9)
+        tree.insert_stream(stream_id=1)
+        tree.insert_stream(stream_id=3, depends_on=1)
+        tree.insert_stream(stream_id=5, depends_on=3)
+
+        pause = tree.pause_subtree(1)
+        tree.remove_stream(1)
+
+        assert pause.released
+        assert 1 not in tree._subtree_pause_handles
+        assert schedulable_stream_ids(tree) == {3, 9}
+        assert pause.release() is False
+
+    def test_removing_paused_root_keeps_nested_handle(self):
+        tree = priority.PriorityTree()
+        tree.insert_stream(stream_id=9)
+        tree.insert_stream(stream_id=1)
+        tree.insert_stream(stream_id=3, depends_on=1)
+        tree.insert_stream(stream_id=5, depends_on=3)
+
+        outer_pause = tree.pause_subtree(1)
+        inner_pause = tree.pause_subtree(3)
+        tree.remove_stream(1)
+
+        assert outer_pause.released
+        assert schedulable_stream_ids(tree) == {9}
+
+        inner_pause.release()
+        assert schedulable_stream_ids(tree) == {3, 9}
+
+    def test_subtree_pause_handle_supports_context_manager(self):
+        tree = priority.PriorityTree()
+        tree.insert_stream(stream_id=1)
+        tree.insert_stream(stream_id=3)
+
+        with tree.pause_subtree(1) as pause:
+            assert schedulable_stream_ids(tree) == {3}
+            assert pause.released is False
+
+        assert pause.released
+        assert schedulable_stream_ids(tree) == {1, 3}
+
+    def test_subtree_pause_validates_stream_id(self):
+        tree = priority.PriorityTree()
+
+        with pytest.raises(priority.PseudoStreamError):
+            tree.pause_subtree(0)
+
+        with pytest.raises(priority.MissingStreamError):
+            tree.pause_subtree(3)
 
     @pytest.mark.parametrize(
         "stream,new_parent,exclusive,weight,blocked,result",

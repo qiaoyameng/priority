@@ -102,6 +102,13 @@ When a stream goes from being blocked to being unblocked, call the ``unblock``
 method to place it back into the sequence. Both the ``block`` and ``unblock``
 methods are idempotent and safe to call repeatedly.
 
+If an upstream connection stops sending, use ``pause_subtree`` to pause that
+stream and all of its logical descendants. The returned handle is released by
+calling ``release`` (or using it as a context manager). Nested pauses remain in
+effect until every owner releases its own handle. Pausing does not change a
+stream's own blocked state: releasing a pause does not unblock a stream that
+was previously blocked.
+
 Additionally, the priority of a stream may change. When it does, the
 ``reprioritize`` method can be used to update the tree in the wake of that
 change. ``reprioritize`` has the same signature as ``insert_stream``, but
