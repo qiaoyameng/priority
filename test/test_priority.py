@@ -540,6 +540,291 @@ class TestPriorityTreeOutput:
             count[stream] == weight
 
 
+class TestCostScheduling:
+    def test_grant_repr(self):
+        grant = priority.Grant(7)
+
+        assert repr(grant) == "Grant<stream_id=7>"
+
+    def test_settling_actual_bytes_balances_unequal_frames(self):
+        tree = priority.PriorityTree()
+        tree.insert_stream(stream_id=1)
+        tree.insert_stream(stream_id=2)
+        frame_sizes = {1: 1024, 2: 65536}
+        sent = collections.Counter()
+
+        for _ in range(2000):
+            grant = tree.acquire_grant()
+            sent[grant.stream_id] += frame_sizes[grant.stream_id]
+            tree.settle_grant(grant, frame_sizes[grant.stream_id])
+
+        total = sum(sent.values())
+
+        assert sent[1] / total == pytest.approx(0.5, abs=0.02)
+        assert sent[2] / total == pytest.approx(0.5, abs=0.02)
+
+    def test_iteration_opportunities_do_not_balance_unequal_frames(self):
+        tree = priority.PriorityTree()
+        tree.insert_stream(stream_id=1)
+        tree.insert_stream(stream_id=2)
+        frame_sizes = {1: 1024, 2: 65536}
+        sent = collections.Counter()
+
+        for _ in range(2000):
+            stream_id = next(tree)
+            sent[stream_id] += frame_sizes[stream_id]
+
+        total = sum(sent.values())
+
+        assert sent[2] / total == pytest.approx(64 / 65, abs=0.02)
+
+    def test_grant_cannot_be_issued_twice_for_same_stream(self):
+        tree = priority.PriorityTree()
+        tree.insert_stream(stream_id=1)
+        tree.insert_stream(stream_id=2)
+
+        grant = tree.acquire_grant()
+
+        assert grant.stream_id == 1
+        assert tree.acquire_grant().stream_id == 2
+        with pytest.raises(priority.DeadlockError):
+            tree.acquire_grant()
+
+        tree.settle_grant(grant, 1024)
+        assert tree.acquire_grant().stream_id == 1
+
+    def test_returned_grant_reinstates_stream_without_charging_cost(self):
+        tree = priority.PriorityTree()
+        tree.insert_stream(stream_id=1)
+        tree.insert_stream(stream_id=2)
+        grant = tree.acquire_grant()
+
+        assert grant.stream_id == 1
+        tree.return_grant(grant)
+
+        reinstated = tree.acquire_grant()
+        assert reinstated.stream_id == 1
+        tree.settle_grant(reinstated, 1024)
+
+    def test_zero_cost_settlement_is_equivalent_to_returning_grant(self):
+        tree = priority.PriorityTree()
+        tree.insert_stream(stream_id=1)
+        tree.insert_stream(stream_id=2)
+
+        grant = tree.acquire_grant()
+        tree.settle_grant(grant, 0)
+
+        assert tree.acquire_grant().stream_id == 1
+
+    @pytest.mark.parametrize("bytes_sent", (-1, -1024, 0.5, "1024", None, object()))
+    def test_settlement_requires_non_negative_integer(self, bytes_sent):
+        tree = priority.PriorityTree()
+        tree.insert_stream(stream_id=1)
+        grant = tree.acquire_grant()
+
+        with pytest.raises(priority.InvalidCostError):
+            tree.settle_grant(grant, bytes_sent)
+
+        tree.settle_grant(grant, 1024)
+        assert tree.acquire_grant().stream_id == 1
+
+    def test_boolean_cost_is_rejected(self):
+        tree = priority.PriorityTree()
+        tree.insert_stream(stream_id=1)
+        grant = tree.acquire_grant()
+
+        with pytest.raises(priority.InvalidCostError):
+            tree.settle_grant(grant, True)
+
+
+    def test_grant_cannot_be_settled_or_returned_twice(self):
+        tree = priority.PriorityTree()
+        tree.insert_stream(stream_id=1)
+        grant = tree.acquire_grant()
+        tree.settle_grant(grant, 1024)
+
+        with pytest.raises(priority.InvalidGrantError):
+            tree.settle_grant(grant, 1024)
+
+        grant = tree.acquire_grant()
+        tree.return_grant(grant)
+
+        with pytest.raises(priority.InvalidGrantError):
+            tree.return_grant(grant)
+
+    def test_foreign_grant_is_rejected(self):
+        tree = priority.PriorityTree()
+        tree.insert_stream(stream_id=1)
+        tree.acquire_grant()
+        foreign_grant = priority.Grant(1)
+
+        with pytest.raises(priority.InvalidGrantError):
+            tree.settle_grant(foreign_grant, 1024)
+
+        with pytest.raises(priority.InvalidGrantError):
+            tree.return_grant(foreign_grant)
+
+    def test_deleting_stream_between_grant_and_settlement_leaves_no_debt(self):
+        tree = priority.PriorityTree()
+        tree.insert_stream(stream_id=1)
+        tree.insert_stream(stream_id=2)
+        first = tree.acquire_grant()
+        second = tree.acquire_grant()
+
+        assert first.stream_id == 1
+        assert second.stream_id == 2
+        tree.remove_stream(1)
+        tree.settle_grant(first, 1_000_000)
+        tree.settle_grant(second, 1024)
+
+        stream = tree._streams[2]
+        assert [
+            (level, queued.stream_id)
+            for level, queued in stream.parent.child_queue
+        ] == [(64, 2)]
+        assert stream._deficit == 0
+
+        next_grant = tree.acquire_grant()
+        assert next_grant.stream_id == 2
+        tree.return_grant(next_grant)
+
+    def test_settling_deleted_stream_grant_is_invalid_twice(self):
+        tree = priority.PriorityTree()
+        tree.insert_stream(stream_id=1)
+        grant = tree.acquire_grant()
+        tree.remove_stream(1)
+
+        tree.settle_grant(grant, 1024)
+
+        with pytest.raises(priority.InvalidGrantError):
+            tree.settle_grant(grant, 1024)
+
+    def test_settling_old_grant_does_not_affect_reinserted_stream(self):
+        tree = priority.PriorityTree()
+        tree.insert_stream(stream_id=1)
+        tree.insert_stream(stream_id=2)
+        old_grant = tree.acquire_grant()
+        other_grant = tree.acquire_grant()
+
+        tree.remove_stream(1)
+        tree.insert_stream(stream_id=1, weight=256)
+        new_grant = tree.acquire_grant()
+
+        assert new_grant.stream_id == 1
+        tree.settle_grant(old_grant, 1_000_000)
+        tree.return_grant(new_grant)
+        tree.settle_grant(other_grant, 1024)
+
+        stream = tree._streams[1]
+        assert stream._deficit == 0
+        assert not stream._outstanding
+        assert [
+            (level, queued.stream_id)
+            for level, queued in tree._root_stream.child_queue
+        ] == [(0, 1), (64, 2)]
+
+    def test_blocked_stream_with_outstanding_grant_allows_dependents(self):
+        tree = priority.PriorityTree()
+        tree.insert_stream(stream_id=1)
+        tree.insert_stream(stream_id=3, depends_on=1)
+        parent_grant = tree.acquire_grant()
+
+        tree.block(1)
+        dependent_grant = tree.acquire_grant()
+
+        assert dependent_grant.stream_id == 3
+        tree.settle_grant(dependent_grant, 1024)
+        tree.settle_grant(parent_grant, 1024)
+
+        tree.block(1)
+        assert [
+            (level, stream.stream_id, stream.active)
+            for level, stream in tree._root_stream.child_queue
+        ] == [(128, 1, False)]
+
+        tree.unblock(1)
+        assert tree.acquire_grant().stream_id == 1
+
+    def test_blocking_immediately_after_grant_allows_dependents(self):
+        tree = priority.PriorityTree()
+        tree.insert_stream(stream_id=1)
+        tree.insert_stream(stream_id=3, depends_on=1)
+        parent_grant = tree.acquire_grant()
+
+        tree.block(1)
+        dependent_grant = tree.acquire_grant()
+
+        assert dependent_grant.stream_id == 3
+        tree.settle_grant(dependent_grant, 1024)
+        tree.settle_grant(parent_grant, 65536)
+
+        assert [
+            (level, stream.stream_id, stream.active)
+            for level, stream in tree._root_stream.child_queue
+        ] == [(4160, 1, False)]
+
+        tree.unblock(1)
+        assert tree.acquire_grant().stream_id == 1
+
+    def test_reprioritizing_stream_between_grant_and_settlement_charges_new_path(self):
+        tree = priority.PriorityTree()
+        tree.insert_stream(stream_id=1)
+        tree.insert_stream(stream_id=2)
+        grant = tree.acquire_grant()
+
+        assert grant.stream_id == 1
+        tree.reprioritize(stream_id=1, depends_on=2)
+        tree.settle_grant(grant, 65536)
+
+        stream2 = tree._streams[2]
+        assert [
+            (level, stream.stream_id)
+            for level, stream in tree._root_stream.child_queue
+        ] == [(4096, 2)]
+        assert [
+            (level, stream.stream_id)
+            for level, stream in stream2.child_queue
+        ] == [(4096, 1)]
+
+    def test_new_child_uses_current_cost_position_of_blocked_parent(self):
+        tree = priority.PriorityTree()
+        tree.insert_stream(stream_id=1)
+        tree.block(1)
+        tree.insert_stream(stream_id=3, depends_on=1)
+        tree.insert_stream(stream_id=2)
+
+        dependent = tree.acquire_grant()
+        assert dependent.stream_id == 3
+        tree.settle_grant(dependent, 65536)
+
+        sibling = tree.acquire_grant()
+        assert sibling.stream_id == 2
+        tree.settle_grant(sibling, 1024)
+
+        tree.insert_stream(stream_id=5, depends_on=1)
+
+        parent = tree._streams[1]
+        assert [
+            (level, stream.stream_id) for level, stream in parent.child_queue
+        ] == [(4096, 3), (4096, 5)]
+
+    def test_legacy_and_cost_interfaces_cannot_be_mixed(self):
+        cost_tree = priority.PriorityTree()
+        cost_tree.insert_stream(stream_id=1)
+        grant = cost_tree.acquire_grant()
+        cost_tree.settle_grant(grant, 1024)
+
+        with pytest.raises(priority.PriorityError):
+            next(cost_tree)
+
+        legacy_tree = priority.PriorityTree()
+        legacy_tree.insert_stream(stream_id=1)
+        assert next(legacy_tree) == 1
+
+        with pytest.raises(priority.PriorityError):
+            legacy_tree.acquire_grant()
+
+
 class PriorityStateMachine(RuleBasedStateMachine):
     """
     This test uses Hypothesis's stateful testing to exercise the priority tree.

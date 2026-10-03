@@ -77,6 +77,41 @@ This looks like this:
 If each stream only sends when it is 'ungated' by this mechanism, the server
 will automatically be emitting stream data in conformance to RFC 7540.
 
+Settling Actual Costs
+~~~~~~~~~~~~~~~~~~~~~
+
+Iteration allocates opportunities, not bytes. If one stream sends 1 KB each
+time it is selected and another sends 64 KB, their cumulative bandwidth will
+not be allocated according to their weights. For those cases, use the
+explicit grant interface instead:
+
+.. code-block:: python
+
+    >>> grant = p.acquire_grant()
+    >>> bytes_sent = send_data(grant.stream_id)
+    >>> p.settle_grant(grant, bytes_sent)
+
+Each call returns one grant; grants to different streams may be outstanding
+at the same time. No scheduling cost is charged until the caller reports the
+number of bytes actually sent. If the opportunity is not used, return the
+grant or settle it with ``0``:
+
+.. code-block:: python
+
+    >>> p.return_grant(grant)
+    >>> # This is equivalent:
+    >>> p.settle_grant(grant, 0)
+
+Only one outstanding grant can exist for a given stream. If the stream is
+blocked, removed, or reprioritized while the grant is outstanding, the tree
+still keeps that opportunity separate; settling or returning it afterwards
+will not charge a removed stream's cost against another stream.
+
+The iterator and grant interfaces must not be mixed on the same tree. Choose
+``next()`` when every opportunity has the same cost, and use grants when
+different sends have different byte counts. Costs must be non-negative
+integers; negative or non-integer values are rejected.
+
 Updating The Tree
 ~~~~~~~~~~~~~~~~~
 

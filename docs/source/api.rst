@@ -7,10 +7,17 @@ Priority Tree
 .. autoclass:: priority.PriorityTree
    :members:
 
+.. autoclass:: priority.Grant
+   :members:
+
 Exceptions
 ----------
 
 .. autoclass:: priority.PriorityError
+
+.. autoclass:: priority.InvalidGrantError
+
+.. autoclass:: priority.InvalidCostError
 
 .. autoclass:: priority.DeadlockError
 

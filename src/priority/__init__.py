@@ -4,10 +4,13 @@ priority: HTTP/2 priority implementation for Python
 """
 from .priority import (  # noqa
     Stream,
+    Grant,
     PriorityTree,
     DeadlockError,
     PriorityLoop,
     PriorityError,
+    InvalidGrantError,
+    InvalidCostError,
     DuplicateStreamError,
     MissingStreamError,
     TooManyStreamsError,

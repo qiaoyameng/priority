@@ -8,7 +8,7 @@ Implementation of the Priority tree data structure.
 
 import heapq
 
-from typing import List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 
 
 class PriorityError(Exception):
@@ -81,6 +81,42 @@ class PseudoStreamError(PriorityError):
     pass
 
 
+class InvalidGrantError(PriorityError):
+    """
+    An operation was attempted with a grant that is not outstanding.
+    """
+
+    pass
+
+
+class InvalidCostError(PriorityError):
+    """
+    A settlement was attempted with a cost that is not a non-negative integer.
+    """
+
+    pass
+
+
+class Grant:
+    """
+    A one-time opportunity to send data on one stream.
+
+    Grants are returned by :meth:`PriorityTree.acquire_grant` and must be
+    settled with :meth:`PriorityTree.settle_grant` or returned with
+    :meth:`PriorityTree.return_grant`.
+
+    :param stream_id: The ID of the stream that the grant applies to.
+    """
+
+    __slots__ = ("stream_id",)
+
+    def __init__(self, stream_id: int) -> None:
+        self.stream_id = stream_id
+
+    def __repr__(self) -> str:
+        return "Grant<stream_id=%d>" % self.stream_id
+
+
 class Stream:
     """
     Priority information for a given stream.
@@ -98,6 +134,9 @@ class Stream:
         self.active = True
         self.last_weight = 0
         self._deficit = 0
+        self._outstanding = False
+        self._held_level = 0
+        self._held_cost = 0
 
     @property
     def weight(self) -> int:
@@ -121,6 +160,11 @@ class Stream:
         """
         child.parent = self
         self.children.append(child)
+
+        if child._outstanding and child.active:
+            child._held_level = self.last_weight
+            return
+
         heapq.heappush(self.child_queue, (self.last_weight, child))
 
     def add_child_exclusive(self, child: "Stream") -> None:
@@ -209,6 +253,51 @@ class Stream:
                 level += (256 + child._deficit) // child.weight
                 child._deficit = (256 + child._deficit) % child.weight
                 heapq.heappush(self.child_queue, (level, child))
+
+        return next_stream
+
+    def acquire(self) -> "Stream":
+        """
+        Returns the next active child that does not have an outstanding grant.
+
+        The selected stream is removed from its parent's queue until its grant
+        is settled. All other queue entries are left unchanged.
+        """
+        assert not self.active
+
+        next_stream: Optional[Stream] = None
+        popped_entries: List[Tuple[int, Stream]] = []
+
+        try:
+            while self.child_queue:
+                level, child = heapq.heappop(self.child_queue)
+                popped_entries.append((level, child))
+
+                if child.active:
+                    if child._outstanding:
+                        continue
+
+                    child._outstanding = True
+                    child._held_level = level
+                    child._held_cost = 0
+                    self.last_weight = level
+                    next_stream = child
+                    break
+
+                try:
+                    next_stream = child.acquire()
+                except IndexError:
+                    continue
+                self.last_weight = level
+                break
+        finally:
+            for level, child in popped_entries:
+                if child is next_stream:
+                    continue
+                heapq.heappush(self.child_queue, (level, child))
+
+        if next_stream is None:
+            raise IndexError("No unblocked streams to schedule.")
 
         return next_stream
 
@@ -304,6 +393,9 @@ class PriorityTree:
         self._root_stream = Stream(stream_id=0, weight=1)
         self._root_stream.active = False
         self._streams = {0: self._root_stream}
+        self._grants: Dict[Grant, Stream] = {}
+        self._legacy_scheduling_used = False
+        self._cost_scheduling_used = False
 
         if not isinstance(maximum_streams, int):
             raise TypeError("maximum_streams must be an int.")
@@ -470,7 +562,15 @@ class PriorityTree:
             raise PseudoStreamError("Cannot block stream 0")
 
         try:
-            self._streams[stream_id].active = False
+            stream = self._streams[stream_id]
+            stream.active = False
+            if stream._outstanding:
+                parent = stream.parent
+                if parent is not None and not self._has_queue_entry(parent, stream):
+                    heapq.heappush(
+                        parent.child_queue,
+                        (stream._held_level + stream._held_cost, stream),
+                    )
         except KeyError:
             raise MissingStreamError("Stream %d not in tree" % stream_id)
 
@@ -492,11 +592,164 @@ class PriorityTree:
     def __iter__(self) -> "PriorityTree":  # pragma: no cover
         return self
 
-    def __next__(self) -> int:  # pragma: no cover
+    def _next_stream(self) -> int:
+        if self._cost_scheduling_used:
+            raise PriorityError(
+                "Cannot use next() on a tree that uses cost-based scheduling"
+            )
+        self._legacy_scheduling_used = True
         try:
             return self._root_stream.schedule()
         except IndexError:
             raise DeadlockError("No unblocked streams to schedule.")
 
+    def __next__(self) -> int:  # pragma: no cover
+        return self._next_stream()
+
     def next(self) -> int:  # pragma: no cover
-        return self.__next__()
+        return self._next_stream()
+
+    def acquire_grant(self) -> Grant:
+        """
+        Acquire a one-time opportunity to send data on the next stream.
+
+        Unlike iterating over the tree, no cost is charged when the grant is
+        acquired. Call :meth:`settle_grant` with the number of bytes actually
+        sent, or :meth:`return_grant` if the opportunity was not used.
+
+        A stream with an outstanding grant will not be selected again until
+        that grant is settled or returned. Grants to different streams may be
+        outstanding concurrently. Cost-based scheduling and the legacy
+        iterator interface cannot be used on the same tree.
+        """
+        if self._legacy_scheduling_used:
+            raise PriorityError(
+                "Cannot use cost-based scheduling on a tree that uses next()"
+            )
+        self._cost_scheduling_used = True
+
+        try:
+            stream = self._root_stream.acquire()
+        except IndexError:
+            raise DeadlockError("No unblocked streams to schedule.")
+
+        grant = Grant(stream.stream_id)
+        self._grants[grant] = stream
+        return grant
+
+    def settle_grant(self, grant: Grant, bytes_sent: int) -> None:
+        """
+        Settle a grant using the number of bytes actually sent.
+
+        Settling with zero bytes is equivalent to returning an unused grant.
+        If the stream was removed after the grant was acquired, the grant is
+        discarded and its cost is not charged to its former parent or children.
+
+        :param grant: A grant returned by :meth:`acquire_grant`.
+        :param bytes_sent: The non-negative integer number of bytes sent.
+        """
+        stream = self._validate_grant(grant)
+        self._validate_cost(bytes_sent)
+
+        self._grants.pop(grant)
+
+        if self._streams.get(stream.stream_id) is not stream:
+            stream._outstanding = False
+            stream._held_level = 0
+            stream._held_cost = 0
+            return
+
+        if bytes_sent == 0:
+            self._finish_grant(stream)
+            return
+
+        self._charge_cost(stream, bytes_sent)
+        self._finish_grant(stream)
+
+    def return_grant(self, grant: Grant) -> None:
+        """
+        Return an unused grant without charging any cost.
+
+        :param grant: A grant returned by :meth:`acquire_grant`.
+        """
+        stream = self._validate_grant(grant)
+        self._grants.pop(grant)
+
+        if self._streams.get(stream.stream_id) is not stream:
+            stream._outstanding = False
+            stream._held_level = 0
+            stream._held_cost = 0
+            return
+
+        self._finish_grant(stream)
+
+    def _validate_grant(self, grant: Grant) -> Stream:
+        stream = self._grants.get(grant)
+        if stream is None:
+            raise InvalidGrantError("Grant is not outstanding")
+        return stream
+
+    @staticmethod
+    def _validate_cost(bytes_sent: int) -> None:
+        if isinstance(bytes_sent, bool) or not isinstance(bytes_sent, int):
+            raise InvalidCostError("Sent bytes must be an integer")
+        if bytes_sent < 0:
+            raise InvalidCostError("Sent bytes must be non-negative")
+
+    def _charge_cost(self, stream: Stream, bytes_sent: int) -> None:
+        child = stream
+
+        while child is not self._root_stream:
+            parent = child.parent
+            total = bytes_sent + child._deficit
+            increment = total // child.weight
+            child._deficit = total % child.weight
+
+            level = self._remove_queue_entry(parent, child)
+            if level is None:
+                child._held_cost += increment
+                parent.last_weight = child._held_level + child._held_cost
+            else:
+                parent.last_weight = level
+                heapq.heappush(parent.child_queue, (level + increment, child))
+
+            child = parent
+
+    def _finish_grant(self, stream: Stream) -> None:
+        stream._outstanding = False
+        if stream.active:
+            self._restore_held_stream(stream)
+        stream._held_level = 0
+        stream._held_cost = 0
+
+    def _restore_held_stream(self, stream: Stream) -> None:
+        parent = stream.parent
+        if parent is None or parent is self._root_stream and stream.stream_id == 0:
+            return
+
+        if self._remove_queue_entry(parent, stream) is None:
+            level = stream._held_level
+            heapq.heappush(
+                parent.child_queue,
+                (level + stream._held_cost, stream),
+            )
+            stream._held_cost = 0
+
+    @staticmethod
+    def _remove_queue_entry(parent: Stream, child: Stream) -> Optional[int]:
+        new_queue: List[Tuple[int, Stream]] = []
+        removed_level = None
+
+        while parent.child_queue:
+            level, queued_child = heapq.heappop(parent.child_queue)
+            if queued_child is child and removed_level is None:
+                removed_level = level
+            else:
+                heapq.heappush(new_queue, (level, queued_child))
+
+        parent.child_queue = new_queue
+        return removed_level
+
+    @staticmethod
+    def _has_queue_entry(parent: Stream, child: Stream) -> bool:
+        return any(queued_child is child for _, queued_child in parent.child_queue)
