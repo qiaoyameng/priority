@@ -13,6 +13,7 @@ from .priority import (  # noqa
     TooManyStreamsError,
     BadWeightError,
     PseudoStreamError,
+    SubtreePauseHandle,
 )
 
 

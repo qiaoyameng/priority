@@ -21,6 +21,25 @@ import priority
 from typing import Iterable, List, Dict, Any
 
 
+def schedulable_streams(tree):
+    result = set()
+
+    def visit(stream, ancestor_paused=False):
+        if ancestor_paused:
+            return
+
+        paused = stream is not tree._root_stream and stream.paused_count > 0
+        if not paused and stream.active:
+            result.add(stream.stream_id)
+            return
+
+        for child in stream.children:
+            visit(child, ancestor_paused or paused)
+
+    visit(tree._root_stream)
+    return result
+
+
 STREAMS_AND_WEIGHTS = lists(
     elements=tuples(integers(min_value=1), integers(min_value=1, max_value=255)),
     unique_by=operator.itemgetter(0),
@@ -300,6 +319,137 @@ class TestPriorityTreeManual:
 
         with pytest.raises(priority.PseudoStreamError):
             p.remove_stream(0)
+
+    def test_nested_subtree_pause_tracks_moving_and_inserted_leaves(self):
+        tree = priority.PriorityTree()
+        tree.insert_stream(stream_id=1)
+        tree.insert_stream(stream_id=2, depends_on=1)
+        tree.insert_stream(stream_id=3, depends_on=2)
+        tree.insert_stream(stream_id=9)
+
+        tree.block(1)
+        tree.block(2)
+
+        snapshots = [schedulable_streams(tree)]
+
+        outer_pause = tree.pause_subtree(1)
+        snapshots.append(schedulable_streams(tree))
+
+        inner_pause = tree.pause_subtree(2)
+        snapshots.append(schedulable_streams(tree))
+        assert {next(tree) for _ in range(12)} == {9}
+
+        tree.reprioritize(stream_id=3)
+        snapshots.append(schedulable_streams(tree))
+        assert {next(tree) for _ in range(12)} == {3, 9}
+
+        tree.insert_stream(stream_id=4, depends_on=2)
+        snapshots.append(schedulable_streams(tree))
+
+        inner_pause.release()
+        snapshots.append(schedulable_streams(tree))
+        assert {next(tree) for _ in range(12)} == {3, 9}
+
+        outer_pause.release()
+        snapshots.append(schedulable_streams(tree))
+        assert {next(tree) for _ in range(12)} == {3, 4, 9}
+
+        assert snapshots == [
+            {3, 9},
+            {9},
+            {9},
+            {3, 9},
+            {3, 9},
+            {3, 9},
+            {3, 4, 9},
+        ]
+        assert not tree._streams[1].active
+        assert not tree._streams[2].active
+
+    def test_separate_subtree_pause_handles_are_nested(self):
+        tree = priority.PriorityTree()
+        tree.insert_stream(stream_id=1)
+        tree.insert_stream(stream_id=2, depends_on=1)
+        tree.insert_stream(stream_id=3)
+
+        first_pause = tree.pause_subtree(1)
+        second_pause = tree.pause_subtree(1)
+
+        assert schedulable_streams(tree) == {3}
+
+        first_pause.close()
+        assert schedulable_streams(tree) == {3}
+
+        second_pause.release()
+        assert schedulable_streams(tree) == {1, 3}
+
+    def test_removing_paused_root_ends_its_handle_without_freezing_children(self):
+        tree = priority.PriorityTree()
+        tree.insert_stream(stream_id=1)
+        tree.insert_stream(stream_id=2, depends_on=1)
+        tree.insert_stream(stream_id=3)
+        tree.block(1)
+
+        outer_pause = tree.pause_subtree(1)
+        inner_pause = tree.pause_subtree(2)
+
+        tree.remove_stream(1)
+
+        assert outer_pause.closed
+        assert not inner_pause.closed
+        assert schedulable_streams(tree) == {3}
+
+        outer_pause.release()
+        assert schedulable_streams(tree) == {3}
+
+        inner_pause.release()
+        assert schedulable_streams(tree) == {2, 3}
+
+    def test_removing_nested_paused_root_preserves_outer_pause(self):
+        tree = priority.PriorityTree()
+        tree.insert_stream(stream_id=1)
+        tree.block(1)
+        tree.insert_stream(stream_id=2, depends_on=1)
+        tree.insert_stream(stream_id=3, depends_on=2)
+        tree.insert_stream(stream_id=4)
+
+        outer_pause = tree.pause_subtree(1)
+        inner_pause = tree.pause_subtree(2)
+
+        tree.remove_stream(2)
+
+        assert inner_pause.closed
+        assert schedulable_streams(tree) == {4}
+
+        inner_pause.release()
+        assert schedulable_streams(tree) == {4}
+
+        outer_pause.release()
+        assert schedulable_streams(tree) == {3, 4}
+
+    def test_subtree_pause_handle_supports_context_manager(self):
+        tree = priority.PriorityTree()
+        tree.insert_stream(stream_id=1)
+        tree.insert_stream(stream_id=2, depends_on=1)
+        tree.insert_stream(stream_id=3)
+
+        with tree.pause_subtree(1) as pause:
+            assert not pause.closed
+            assert schedulable_streams(tree) == {3}
+            assert [next(tree) for _ in range(4)] == [3, 3, 3, 3]
+
+        assert pause.closed
+        assert schedulable_streams(tree) == {1, 3}
+        assert [next(tree) for _ in range(4)] == [1, 3, 1, 3]
+
+    def test_subtree_pause_validates_stream_ids(self):
+        tree = priority.PriorityTree()
+
+        with pytest.raises(priority.PseudoStreamError):
+            tree.pause_subtree(0)
+
+        with pytest.raises(priority.MissingStreamError):
+            tree.pause_subtree(1)
 
     @pytest.mark.parametrize("exclusive", [True, False])
     def test_priority_allows_inserting_stream_with_absent_parent(self, exclusive):

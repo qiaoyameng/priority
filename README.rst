@@ -102,6 +102,29 @@ When a stream goes from being blocked to being unblocked, call the ``unblock``
 method to place it back into the sequence. Both the ``block`` and ``unblock``
 methods are idempotent and safe to call repeatedly.
 
+Pausing Subtrees
+~~~~~~~~~~~~~~~~
+
+When an upstream connection stops sending, every logical stream below its
+current priority node must stop temporarily. Call ``pause_subtree`` to get a
+``SubtreePauseHandle``; the paused stream and all of its descendants are
+removed from scheduling, but their individual ``block`` states are preserved.
+
+Pauses may be nested. Each manager must release its own handle, and a subtree
+is schedulable again only after all of its handles have been released. Streams
+that move into or out of the subtree while it is paused are scheduled
+according to their current ancestors. Removing the paused stream closes all
+handles for that stream and prevents them from affecting streams that are
+reparented when it is removed.
+
+For example:
+
+.. code-block:: python
+
+    >>> pause = p.pause_subtree(stream_id)
+    >>> # ...
+    >>> pause.release()
+
 Additionally, the priority of a stream may change. When it does, the
 ``reprioritize`` method can be used to update the tree in the wake of that
 change. ``reprioritize`` has the same signature as ``insert_stream``, but

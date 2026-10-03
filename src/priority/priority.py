@@ -8,7 +8,8 @@ Implementation of the Priority tree data structure.
 
 import heapq
 
-from typing import List, Tuple, Optional
+from types import TracebackType
+from typing import Dict, List, Optional, Set, Tuple, Type
 
 
 class PriorityError(Exception):
@@ -81,6 +82,64 @@ class PseudoStreamError(PriorityError):
     pass
 
 
+class SubtreePauseHandle:
+    """
+    A handle representing one subtree pause.
+
+    Releasing the handle removes one level of pausing. Handles are idempotent
+    and may be used as context managers.
+    """
+
+    def __init__(self, tree: "PriorityTree", stream: "Stream") -> None:
+        self._tree: "PriorityTree" = tree
+        self._stream: "Stream" = stream
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        """Whether this handle has been released or invalidated."""
+        return self._closed
+
+    def _close_on_removal(self) -> None:
+        self._detach()
+
+    def _detach(self) -> None:
+        self._closed = True
+        del self._tree
+        del self._stream
+
+    def release(self) -> None:
+        """
+        Release one level of pausing. Releasing after the stream is removed is
+        idempotent because that removal ended the pause.
+        """
+        if self._closed:
+            return
+
+        tree = self._tree
+        stream = self._stream
+        stream.paused_count -= 1
+        handles = tree._pause_handles[stream.stream_id]
+        handles.discard(self)
+        if not handles:
+            del tree._pause_handles[stream.stream_id]
+
+        self._detach()
+
+    close = release
+
+    def __enter__(self) -> "SubtreePauseHandle":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_value: Optional[BaseException],
+        traceback: Optional[TracebackType],
+    ) -> None:
+        self.release()
+
+
 class Stream:
     """
     Priority information for a given stream.
@@ -96,6 +155,7 @@ class Stream:
         self.parent: Optional[Stream] = None
         self.child_queue: List[Tuple[int, Stream]] = []
         self.active = True
+        self.paused_count = 0
         self.last_weight = 0
         self._deficit = 0
 
@@ -194,7 +254,9 @@ class Stream:
                 popped_streams.append(val)
                 level, child = val
 
-                if child.active:
+                if child.paused_count > 0:
+                    continue
+                elif child.active:
                     next_stream = child.stream_id
                 else:
                     # Guard against the possibility that the child also has no
@@ -304,6 +366,7 @@ class PriorityTree:
         self._root_stream = Stream(stream_id=0, weight=1)
         self._root_stream.active = False
         self._streams = {0: self._root_stream}
+        self._pause_handles: Dict[int, Set[SubtreePauseHandle]] = {}
 
         if not isinstance(maximum_streams, int):
             raise TypeError("maximum_streams must be an int.")
@@ -335,6 +398,14 @@ class PriorityTree:
         semantics of exclusive insertion.
         """
         parent_stream.add_child_exclusive(inserted_stream)
+
+    def _close_pause_handles(self, stream_id: int) -> None:
+        """
+        End all pauses owned by a stream that is being removed.
+        """
+        handles = self._pause_handles.pop(stream_id, set())
+        for handle in handles:
+            handle._close_on_removal()
 
     def insert_stream(
         self,
@@ -457,8 +528,33 @@ class PriorityTree:
         except KeyError:
             raise MissingStreamError("Stream %d not in tree" % stream_id)
 
+        self._close_pause_handles(stream_id)
         parent = child.parent
         parent.remove_child(child)  # type: ignore[union-attr]
+
+    def pause_subtree(self, stream_id: int) -> SubtreePauseHandle:
+        """
+        Temporarily prevent a stream and all of its current descendants from
+        being scheduled.
+
+        Pauses are reference counted. Multiple callers may pause nested or
+        identical subtrees, and each caller must release its own handle.
+        Pausing does not change a stream's blocked state. Removing the paused
+        stream closes the handles for that stream; its children are then
+        reparented without retaining the removed pause.
+        """
+        if stream_id == 0:
+            raise PseudoStreamError("Cannot pause stream 0")
+
+        try:
+            stream = self._streams[stream_id]
+        except KeyError:
+            raise MissingStreamError("Stream %d not in tree" % stream_id)
+
+        stream.paused_count += 1
+        handle = SubtreePauseHandle(self, stream)
+        self._pause_handles.setdefault(stream_id, set()).add(handle)
+        return handle
 
     def block(self, stream_id: int) -> None:
         """

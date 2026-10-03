@@ -7,6 +7,9 @@ Priority Tree
 .. autoclass:: priority.PriorityTree
    :members:
 
+.. autoclass:: priority.SubtreePauseHandle
+   :members:
+
 Exceptions
 ----------
 
